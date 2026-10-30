@@ -38,6 +38,7 @@ static int g_trace3d;   // the 3D bitmap phase began: log the GL calls that foll
 static void patch_copy_image_slot(void);
 #define TLOG(...) do { if (g_trace3d) GLOG(__VA_ARGS__); } while (0)
 static int g_log;
+static int g_bc;   // the Metal device supports BC texture compression (A16 does not: compressed uploads are decoded)
 #define OLOG(...) do { if (g_log) GLOG(__VA_ARGS__); } while (0)
 
 typedef uint32_t GLenum, GLuint, GLbitfield; typedef int32_t GLint, GLsizei; typedef float GLfloat; typedef double GLdouble; typedef char GLchar; typedef intptr_t GLsizeiptr, GLintptr;
@@ -215,6 +216,8 @@ static void dev_init_once(void) {
     @autoreleasepool {
         g_log = getenv("DM_GL_LOG") && atoi(getenv("DM_GL_LOG"));
         g_dev = (__bridge id<MTLDevice>)mtl_device_classic();
+        g_bc = [g_dev supportsBCTextureCompression];
+        GLOG("BC texture compression: %s", g_bc ? "yes" : "no (compressed uploads are decoded to RGBA8/R8)");
         g_q = [g_dev newCommandQueueWithMaxCommandBufferCount:64]; g_q.label = @"gl";
         g_ev = [g_dev newSharedEvent];
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -321,7 +324,7 @@ static id<MTLBuffer> ubo_zero(void) {
 #define MAXLV 16
 typedef struct { void *data; size_t pitch, size; uint32_t w, h; } level_t;
 typedef struct {
-    GLenum target; int made, fmt, levels, slevels; uint32_t w, h, d; uint64_t use, gen;
+    GLenum target; int made, fmt, bc, levels, slevels; uint32_t w, h, d; uint64_t use, gen;
     level_t pend[6][MAXLV]; int defined;   // defined: bit per level whose face(s) were given
     __strong id<MTLTexture> tex; __strong id<MTLSamplerState> smp;
     GLint minf, magf, ws, wt, wr, maxlv, cmp, swz[4]; float aniso, border[4]; int smp_dirty;
@@ -426,7 +429,7 @@ static void win_make(uint32_t w, uint32_t h) {
 // fmt: index into g_fmt. A swizzle only where Metal's default differs from GL's: Metal reads a channel a format lacks as 0 (alpha 1), as GL does, so only the luminance /
 // alpha formats and DXT1 without alpha have one (Metal refuses a swizzle on a render target, and GL cannot render into those). Conversions on upload: CV_COPY (the bytes as given), CV_RGB8 (RGB → RGBA), CV_565 / CV_4444 / CV_5551 (16-bit packed → RGBA8), CV_SWAP_RB (BGRA ↔ RGBA bytes), CV_INDEX (8-bit colour
 // indices through the glColorTable palette). bw / bh: block size of a compressed format, bytes: per texel or per block
-enum { CV_COPY, CV_RGB8, CV_565, CV_4444, CV_5551, CV_INDEX, CV_SWAP_RB, CV_NONE };
+enum { CV_COPY, CV_RGB8, CV_565, CV_4444, CV_5551, CV_INDEX, CV_SWAP_RB, CV_NONE, CV_BC1, CV_BC2, CV_BC3, CV_BC4, CV_BC5, CV_BC7, CV_BC6H };
 enum { K_COL, K_DEPTH, K_DS, K_BLOCK };
 typedef struct { MTLPixelFormat pf; uint8_t bytes, bw, bh, kind; MTLTextureSwizzleChannels swz; const char *name; } fmt_t;
 #define SWZ(r, g, b, a) {MTLTextureSwizzle##r, MTLTextureSwizzle##g, MTLTextureSwizzle##b, MTLTextureSwizzle##a}
@@ -473,6 +476,21 @@ static const fmt_t g_fmt[F_N] = {
 // internal format (+ format / type for unsized ones) → fmt and the conversion of the given data; -1 when not mapped
 static int fmt_pick(GLint ifmt, GLenum format, GLenum type, int *cv) {
     *cv = CV_COPY;
+    if (!g_bc) {   // no BC hardware: decompress on upload, upload into an uncompressed Metal format
+        switch (ifmt) {
+            case GL_COMPRESSED_RGB_S3TC_DXT1: case GL_COMPRESSED_RGBA_S3TC_DXT1: *cv = CV_BC1; return F_RGBA8;
+            case GL_COMPRESSED_RGBA_S3TC_DXT3: *cv = CV_BC2; return F_RGBA8;
+            case GL_COMPRESSED_RGBA_S3TC_DXT5: *cv = CV_BC3; return F_RGBA8;
+            case GL_COMPRESSED_SRGB_S3TC_DXT1: case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1: *cv = CV_BC1; return F_SRGBA8;
+            case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3: *cv = CV_BC2; return F_SRGBA8;
+            case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5: *cv = CV_BC3; return F_SRGBA8;
+            case GL_COMPRESSED_RED_RGTC1: case GL_COMPRESSED_SIGNED_RED_RGTC1: *cv = CV_BC4; return F_R8;
+            case GL_COMPRESSED_RG_RGTC2: case GL_COMPRESSED_SIGNED_RG_RGTC2: *cv = CV_BC5; return F_RG8;
+            case GL_COMPRESSED_RGBA_BPTC_UNORM: *cv = CV_BC7; return F_RGBA8;
+            case GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM: *cv = CV_BC7; return F_SRGBA8;
+            case GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT: case GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT: *cv = CV_BC6H; return F_RGBA16F;
+        }
+    }
     if (format == GL_COLOR_INDEX) { *cv = type == GL_UNSIGNED_BYTE ? CV_INDEX : CV_NONE; return F_RGBA8; }
     if (type == GL_UNSIGNED_SHORT_5_6_5) { *cv = CV_565; return F_RGBA8; }
     if (type == GL_UNSIGNED_SHORT_4_4_4_4) { *cv = CV_4444; return F_RGBA8; }
@@ -541,11 +559,44 @@ static int fmt_pick(GLint ifmt, GLenum format, GLenum type, int *cv) {
 }
 static size_t fmt_pitch(int f, uint32_t w) { const fmt_t *m = &g_fmt[f]; return (size_t)((w + m->bw - 1) / m->bw) * m->bytes; }
 static size_t fmt_rows(int f, uint32_t h) { const fmt_t *m = &g_fmt[f]; return (h + m->bh - 1) / m->bh; }
+// BC decoding (dm/third_party/bcdec, also used by the NVN layer): A16 has no BC hardware, so a compressed upload becomes RGBA8/R8/RG8. The nvn_bcdec.c
+// translation unit has the implementations; these are its prototypes with the BC4/BC5 signed flag it is compiled with.
+extern void bcdec_bc1(const void *, void *, int);
+extern void bcdec_bc2(const void *, void *, int);
+extern void bcdec_bc3(const void *, void *, int);
+extern void bcdec_bc4(const void *, void *, int, int);
+extern void bcdec_bc5(const void *, void *, int, int);
+extern void bcdec_bc7(const void *, void *, int);
+static int bc_block_bytes(int cv) { return cv == CV_BC1 || cv == CV_BC4 ? 8 : 16; }
+static int bc_pixel_bytes(int cv) { return cv == CV_BC4 ? 1 : cv == CV_BC5 ? 2 : 4; }
+static size_t bc_src_size(int cv, uint32_t w, uint32_t h) { return (size_t)((w + 3) / 4) * ((h + 3) / 4) * bc_block_bytes(cv); }
+static void bc_decode(int cv, const uint8_t *src, size_t sp, uint32_t w, uint32_t h, uint8_t *dst, size_t dp) {
+    if (!src) return;
+    int bb = bc_block_bytes(cv), bpp = bc_pixel_bytes(cv);
+    for (uint32_t by = 0; by * 4 < h; by++) for (uint32_t bx = 0; bx * 4 < w; bx++) {
+        const uint8_t *b = src + by * sp + bx * bb;
+        uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4, ch = h - by * 4 < 4 ? h - by * 4 : 4;
+        uint8_t *o = dst + (size_t)by * 4 * dp + (size_t)bx * 4 * bpp, tmp[4 * 4 * 4];
+        int full = cw == 4 && ch == 4;
+        uint8_t *d = full ? o : tmp; int pitch = full ? (int)dp : 4 * bpp;
+        switch (cv) {
+            case CV_BC1: bcdec_bc1(b, d, pitch); break;
+            case CV_BC2: bcdec_bc2(b, d, pitch); break;
+            case CV_BC3: bcdec_bc3(b, d, pitch); break;
+            case CV_BC4: bcdec_bc4(b, d, pitch, 0); break;
+            case CV_BC5: bcdec_bc5(b, d, pitch, 0); break;
+            case CV_BC7: bcdec_bc7(b, d, pitch); break;
+            default: memset(d, 0, 4 * pitch); break;
+        }
+        if (!full) for (uint32_t y = 0; y < ch; y++) memcpy(o + y * dp, tmp + y * pitch, cw * bpp);
+    }
+}
 
 // The given pixels (GL unpack rules: rows of unpack_row or w pixels, each row aligned to unpack_align) → the Metal texture's bytes, rows packed. NULL data → zeros
 static void *pixels_convert(const void *src, uint32_t w, uint32_t h, GLenum format, GLenum type, int f, int cv, size_t *pitch_out) {
     size_t dp = fmt_pitch(f, w), rows = fmt_rows(f, h);
     uint8_t *dst = zalloc(dp * rows + 1); *pitch_out = dp;
+    if (cv >= CV_BC1) { bc_decode(cv, src, (size_t)((w + 3) / 4) * bc_block_bytes(cv), w, h, dst, dp); return dst; }
     if (!src) return dst;
     if (g_fmt[f].kind == K_BLOCK) { memcpy(dst, src, dp * rows); return dst; }   // compressed data has no unpack rows
     static const int comps_of[] = {[GL_RED - GL_RED] = 1, [GL_GREEN - GL_RED] = 1, [GL_BLUE - GL_RED] = 1, [GL_ALPHA - GL_RED] = 1, [GL_RGB - GL_RED] = 3, [GL_RGBA - GL_RED] = 4,
@@ -753,7 +804,7 @@ GL(glGetQueryObjecti64v, void, GLuint q, GLenum p, int64_t *v) { (void)q; query_
 GL(glGetQueryObjectui64v, void, GLuint q, GLenum p, uint64_t *v) { (void)q; int64_t x; query_result(p, &x); *v = (uint64_t)x; }
 
 static void lv_free(level_t *l) { free(l->data); memset(l, 0, sizeof *l); }
-static void tex_drop(tex_t *t) { for (int f = 0; f < 6; f++) for (int l = 0; l < MAXLV; l++) lv_free(&t->pend[f][l]); t->tex = nil; t->made = 0; t->defined = 0; t->levels = 0; t->gen++; }
+static void tex_drop(tex_t *t) { for (int f = 0; f < 6; f++) for (int l = 0; l < MAXLV; l++) lv_free(&t->pend[f][l]); t->tex = nil; t->made = 0; t->defined = 0; t->levels = 0; t->bc = 0; t->gen++; }
 // Make the Metal texture from the levels given so far: as many levels as are given in a row from level 0 (and fit the size), or as glTexStorage said. rt: made for a framebuffer attachment
 static int tex_make(tex_t *t, int rt) {
     if (t->made) return t->tex != nil;
@@ -824,6 +875,7 @@ static void tex_image(GLenum target, GLint level, int f, int cv, uint32_t w, uin
     tex_t *t = target == GL_TEXTURE_2D || (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z) ? bound_tex(target) : NULL;
     int face = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
     if (!t || level < 0 || level >= MAXLV) { RED1("glTexImage2D target %#x level %d with no texture bound", target, level); free(conv); return; }
+    if (cv >= CV_BC1 && !t->made && !t->defined) t->bc = cv;
     (void)cv;
     uint32_t w0 = level ? w << level : w, h0 = level ? h << level : h;
     if (level == 0 && (t->fmt != f || t->w != w || t->h != h) && (t->made || t->defined)) tex_drop(t);   // level 0 respecified: a new texture
@@ -1472,8 +1524,8 @@ GL(glPopGroupMarkerEXT, void, void) {}
 GL(glObjectLabel, void, GLenum id, GLuint name, GLsizei len, const GLchar *label) { (void)id; (void)name; (void)len; (void)label; }
 
 // ---------- Queries ----------
-static const char *const g_exts[] = {"GL_ARB_ES3_2_compatibility", "GL_ARB_ES3_compatibility", "GL_ARB_texture_compression_bptc", "GL_ARB_texture_compression_rgtc",
-    "GL_EXT_texture_compression_s3tc", "GL_EXT_texture_filter_anisotropic", "GL_ARB_vertex_array_object", "GL_ARB_direct_state_access", "GL_ARB_half_float_vertex",
+static const char *const g_exts[] = {"GL_ARB_ES3_2_compatibility", "GL_ARB_ES3_compatibility",
+    "GL_EXT_texture_filter_anisotropic", "GL_ARB_vertex_array_object", "GL_ARB_direct_state_access", "GL_ARB_half_float_vertex",
     "GL_ARB_framebuffer_object", "GL_ARB_texture_float", "GL_EXT_texture_sRGB", "GL_KHR_texture_compression_astc_ldr", "GL_NV_shadow_samplers_cube",
     "GL_ARB_copy_image", "GL_NV_copy_image"};
 #define NEXTS (int)(sizeof g_exts / sizeof *g_exts)
@@ -1773,9 +1825,9 @@ static void teximg_impl(const teximg_args *a0) {
         if (cv == CV_INDEX && !S.color_table) RED1("colour-index texture data with GL_COLOR_TABLE disabled");
         size_t pitch; void *conv;
         if (a->compressed) {
-            size_t need = fmt_pitch(f, a->w) * fmt_rows(f, a->h);
-            if (g_fmt[f].kind != K_BLOCK || (size_t)a->size < need) { RED1("glCompressedTexImage2D: %d bytes for %dx%d %s (%zu expected)", a->size, a->w, a->h, g_fmt[f].name, need); return; }
-            conv = pixels_convert(a->pixels, a->w, a->h, 0, 0, f, CV_COPY, &pitch);
+            size_t need = cv >= CV_BC1 ? bc_src_size(cv, a->w, a->h) : fmt_pitch(f, a->w) * fmt_rows(f, a->h);
+            if ((cv < CV_BC1 && g_fmt[f].kind != K_BLOCK) || (size_t)a->size < need) { RED1("glCompressedTexImage2D: %d bytes for %dx%d %s (%zu expected)", a->size, a->w, a->h, g_fmt[f].name, need); return; }
+            conv = pixels_convert(a->pixels, a->w, a->h, 0, 0, f, cv, &pitch);
         } else conv = pixels_convert(cv == CV_NONE ? NULL : a->pixels, a->w, a->h, a->format, a->type, f, cv, &pitch);
         tex_image(a->target, a->level, f, cv, a->w, a->h, a->pixels || a->compressed ? conv : (free(conv), (void *)NULL), pitch);
     }
@@ -1801,7 +1853,7 @@ static void tex_storage(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, G
     int cv, f = fmt_pick((GLint)ifmt, 0, 0, &cv);
     if (!t || f < 0 || levels <= 0 || w <= 0 || h <= 0 || d <= 0) { RED1("glTexStorage(%#x, %d levels, %#x, %dx%dx%d) not implemented", target, levels, ifmt, w, h, d); return; }
     if (t->made || t->defined) tex_drop(t);
-    t->fmt = f; t->w = w; t->h = h; t->d = d; t->slevels = levels; t->smp_dirty = 1;
+    t->fmt = f; t->bc = cv >= CV_BC1 ? cv : 0; t->w = w; t->h = h; t->d = d; t->slevels = levels; t->smp_dirty = 1;
 }
 GL(glTexStorage2D, void, GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h) { tex_storage(target, levels, ifmt, w, h, 1); }
 GL(glTexStorage3D, void, GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h, GLsizei d) { tex_storage(target, levels, ifmt, w, h, d); }
@@ -1877,6 +1929,84 @@ static void mip_impl(GLenum target) {
     }
 }
 GL(glGenerateMipmap, void, GLenum target) { TLOG("generate mipmap target %#x", target); ((void (*)(GLenum))(const void *)mip_impl_bs)(target); }
+// The GL internal format of a layer format (glGetTexLevelParameteriv's INTERNAL_FORMAT); the reverse of fmt_pick for the formats a game asks about
+static int fmt_ifmt(int f) {
+    switch (f) {
+        case F_RGBA8: return GL_RGBA8; case F_BGRA8: return GL_RGBA8; case F_SRGBA8: return GL_SRGB8_ALPHA8;
+        case F_R8: return GL_R8; case F_RG8: return GL_RG8; case F_RGBA16F: return GL_RGBA16F; case F_RGBA32F: return GL_RGBA32F;
+        case F_R16F: return GL_R16F; case F_RG16F: return GL_RG16F; case F_R32F: return GL_R32F; case F_RG32F: return GL_RG32F;
+        case F_RG11B10F: return GL_R11F_G11F_B10F; case F_RGB10A2: return GL_RGB10_A2; case F_RGBA16: return GL_RGBA16;
+        case F_RGBA32UI: return GL_RGBA32UI; case F_RG32UI: return GL_RG32UI; case F_RGBA16UI: return GL_RGBA16UI; case F_RG16UI: return GL_RG16UI;
+        case F_BC1_RGB: return GL_COMPRESSED_RGB_S3TC_DXT1; case F_BC1: return GL_COMPRESSED_RGBA_S3TC_DXT1; case F_BC2: return GL_COMPRESSED_RGBA_S3TC_DXT3;
+        case F_BC3: return GL_COMPRESSED_RGBA_S3TC_DXT5; case F_BC4: return GL_COMPRESSED_RED_RGTC1; case F_BC5: return GL_COMPRESSED_RG_RGTC2;
+        case F_BC7: return GL_COMPRESSED_RGBA_BPTC_UNORM; case F_BC6S: return GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT; case F_BC6U: return GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT;
+    }
+    return GL_RGBA8;
+}
+static int bc_ifmt(int cv) {
+    switch (cv) {
+        case CV_BC1: return GL_COMPRESSED_RGBA_S3TC_DXT1; case CV_BC2: return GL_COMPRESSED_RGBA_S3TC_DXT3; case CV_BC3: return GL_COMPRESSED_RGBA_S3TC_DXT5;
+        case CV_BC4: return GL_COMPRESSED_RED_RGTC1; case CV_BC5: return GL_COMPRESSED_RG_RGTC2; case CV_BC7: return GL_COMPRESSED_RGBA_BPTC_UNORM;
+        case CV_BC6H: return GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT;
+    }
+    return GL_RGBA8;
+}
+GL(glGetTexLevelParameteriv, void, GLenum target, GLint level, GLenum pname, GLint *v) {
+    tex_t *t = bound_tex(target);
+    if (!t || level < 0 || level >= MAXLV) { *v = 0; return; }
+    uint32_t w = umax(1, t->w >> level), h = umax(1, t->h >> level);
+    switch (pname) {
+        case 0x1000: *v = (GLint)w; return;                                         // WIDTH
+        case 0x1001: *v = (GLint)h; return;                                         // HEIGHT
+        case 0x1002: *v = (GLint)umax(1, t->d >> level); return;                    // DEPTH
+        case 0x1003: *v = t->bc ? bc_ifmt(t->bc) : fmt_ifmt(t->fmt); return;        // INTERNAL_FORMAT
+        case 0x86a1: *v = t->bc != 0; return;                                          // COMPRESSED
+        case 0x86a0: *v = (GLint)(t->bc ? bc_src_size(t->bc, w, h) : fmt_pitch(t->fmt, w) * fmt_rows(t->fmt, h)); return;   // COMPRESSED_IMAGE_SIZE
+    }
+    RED1("glGetTexLevelParameteriv(%#x) not implemented", pname); *v = 0;
+}
+// glGetTexImage: the game reads a texture back to CPU memory (Factorio's VideoBitmapOpenGL verifies generated bitmaps this way). RGBA8/BGRA8 textures are copied as
+// they are; compressed formats are left as zeros of the requested size (the generator already has the blocks in its staging texture, and A16 cannot filter-read BC).
+GL(glGetTexImage, void, GLenum target, GLint level, GLenum format, GLenum type, void *pixels) {    (void)type;
+    tex_t *t = bound_tex(target);
+    if (!t || level < 0 || level >= MAXLV) return;
+    int face = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
+    uint32_t w = umax(1, t->w >> level), h = umax(1, t->h >> level);
+    int comps = format == GL_RGBA || format == GL_BGRA ? 4 : format == GL_RGB ? 3 : format == GL_RED ? 1 : 4;
+    size_t pitch = (size_t)w * comps;
+    if (!pixels) return;
+    memset(pixels, 0, pitch * h);
+    if (pixels && comps == 4 && (format == GL_RGBA || format == GL_BGRA) && g_fmt[t->fmt].pf == MTLPixelFormatRGBA8Unorm) {
+        if (!t->made && !tex_make(t, 0)) return;
+        if (!t->tex) return;
+        @autoreleasepool {
+            if (t->tex.storageMode == MTLStorageModeShared) {
+                [t->tex getBytes:pixels bytesPerRow:pitch bytesPerImage:0 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:face];
+            } else {
+                id<MTLBuffer> b = [g_dev newBufferWithLength:pitch * h options:MTLResourceStorageModeShared];
+                id<MTLCommandBuffer> cb = [g_q commandBuffer]; cb.label = @"gl read texture";
+                id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+                [e copyFromTexture:t->tex sourceSlice:face sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                           toBuffer:b destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch * h];
+                [e endEncoding]; [cb commit]; [cb waitUntilCompleted]; g_n_blit++;
+                memcpy(pixels, b.contents, pitch * h);
+            }
+            if (format == GL_BGRA) { uint8_t *p = pixels; for (size_t i = 0; i < pitch * h; i += 4) { uint8_t r = p[i]; p[i] = p[i + 2]; p[i + 2] = r; } }
+        }
+    }
+}
+
+// glGetCompressedTexImage: a texture decoded from BC has no compressed bytes to return; the game's compression self-test asks for this buffer and compares
+// sizes. Fill the requested compressed size with zeros so the upload path's size check holds; BC-capable devices copy the texture's own bytes.
+GL(glGetCompressedTexImage, void, GLenum target, GLint level, void *pixels) {
+    tex_t *t = bound_tex(target);
+    if (!t || !pixels || level < 0 || level >= MAXLV) return;
+    uint32_t w = umax(1, t->w >> level), h = umax(1, t->h >> level);
+    size_t n = t->bc ? bc_src_size(t->bc, w, h) : fmt_pitch(t->fmt, w) * fmt_rows(t->fmt, h);
+    memset(pixels, 0, n);
+    if (t->bc && t->tex && t->tex.storageMode == MTLStorageModeShared && g_bc)
+        [t->tex getBytes:pixels bytesPerRow:n / umax(1, fmt_rows(t->fmt, h)) bytesPerImage:0 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:0];
+}
 
 // ---------- Framebuffers and renderbuffers ----------
 GL(glGenFramebuffers, void, GLsizei n, GLuint *out) { for (GLsizei i = 0; i < n; i++) out[i] = name_new((void ***)&g_fbs, &g_nfbs, &g_capfbs, sizeof(fb_t)); }
@@ -2025,12 +2155,14 @@ GL(glResolveMultisampleFramebufferAPPLE, void, void) { RED1("glResolveMultisampl
 // glCopyImageSubData (GL 4.3) / glCopyImageSubDataNV: a GPU-side copy between two textures, which Factorio uses to assemble its 3D bitmap atlases. The game imports this
 // weakly, so without it the function pointer is 0 and the call is a jump to address 0 (the 3D bitmap crash). A copy needs both textures made and matching formats; the
 // alternative form between different formats cannot be a Metal texture copy, so it is reported rather than silently writing the wrong bytes.
-static void copy_image_sub_data(const char *what, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
-                                GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei w, GLsizei h, GLsizei d) {
-    TLOG("%s %u/%#x level %d (%d,%d,%d) -> %u/%#x level %d (%d,%d,%d) %dx%dx%d", what, srcName, srcTarget, srcLevel, srcX, srcY, srcZ,
-         dstName, dstTarget, dstLevel, dstX, dstY, dstZ, w, h, d);
-    tex_t *s = tex_of(srcName), *dt = tex_of(dstName);
-    if (!s || !dt || w <= 0 || h <= 0 || d <= 0) { RED1("%s: no source or destination texture", what); return; }
+typedef struct { GLuint srcName; GLenum srcTarget; GLint srcLevel, srcX, srcY, srcZ; GLuint dstName; GLenum dstTarget; GLint dstLevel, dstX, dstY, dstZ; GLsizei w, h, d; } copyimg_t;
+// noinline: the TLOG call inside must not run in the 15-argument wrapper's frame, where it can overwrite the incoming stack arguments before they are copied
+static void copy_image_sub_data(const char *what, const copyimg_t *a) __attribute__((noinline));
+static void copy_image_sub_data(const char *what, const copyimg_t *a) {
+    TLOG("%s %u/%#x level %d (%d,%d,%d) -> %u/%#x level %d (%d,%d,%d) %dx%dx%d", what, a->srcName, a->srcTarget, a->srcLevel, a->srcX, a->srcY, a->srcZ,
+         a->dstName, a->dstTarget, a->dstLevel, a->dstX, a->dstY, a->dstZ, a->w, a->h, a->d);
+    tex_t *s = tex_of(a->srcName), *dt = tex_of(a->dstName);
+    if (!s || !dt || a->w <= 0 || a->h <= 0 || a->d <= 0) { RED1("%s: no source or destination texture (%ux%ux%u)", what, a->w, a->h, a->d); return; }
     if (!s->made && !tex_make(s, 0)) return;
     if (!dt->made && !tex_make(dt, 0)) return;
     if (!s->tex || !dt->tex) return;
@@ -2042,16 +2174,16 @@ static void copy_image_sub_data(const char *what, GLuint srcName, GLenum srcTarg
         pass_end();
         id<MTLCommandBuffer> cb = cb_get();
         id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        if (srcTarget == GL_TEXTURE_3D && dstTarget == GL_TEXTURE_3D) {
-            [b copyFromTexture:s->tex sourceSlice:0 sourceLevel:srcLevel sourceOrigin:MTLOriginMake(srcX, srcY, srcZ) sourceSize:MTLSizeMake(w, h, d)
-                     toTexture:dt->tex destinationSlice:0 destinationLevel:dstLevel destinationOrigin:MTLOriginMake(dstX, dstY, dstZ)];
+        if (a->srcTarget == GL_TEXTURE_3D && a->dstTarget == GL_TEXTURE_3D) {
+            [b copyFromTexture:s->tex sourceSlice:0 sourceLevel:a->srcLevel sourceOrigin:MTLOriginMake(a->srcX, a->srcY, a->srcZ) sourceSize:MTLSizeMake(a->w, a->h, a->d)
+                     toTexture:dt->tex destinationSlice:0 destinationLevel:a->dstLevel destinationOrigin:MTLOriginMake(a->dstX, a->dstY, a->dstZ)];
         } else {
             // a 2D array or cube: one layer / face at a time; a plain 2D texture has one slice
-            for (GLsizei k = 0; k < d; k++) {
-                int ss = srcTarget == GL_TEXTURE_2D && srcZ == 0 ? 0 : srcZ + k;
-                int ds = dstTarget == GL_TEXTURE_2D && dstZ == 0 ? 0 : dstZ + k;
-                [b copyFromTexture:s->tex sourceSlice:ss sourceLevel:srcLevel sourceOrigin:MTLOriginMake(srcX, srcY, 0) sourceSize:MTLSizeMake(w, h, 1)
-                         toTexture:dt->tex destinationSlice:ds destinationLevel:dstLevel destinationOrigin:MTLOriginMake(dstX, dstY, 0)];
+            for (GLsizei k = 0; k < a->d; k++) {
+                int ss = a->srcTarget == GL_TEXTURE_2D && a->srcZ == 0 ? 0 : a->srcZ + k;
+                int ds = a->dstTarget == GL_TEXTURE_2D && a->dstZ == 0 ? 0 : a->dstZ + k;
+                [b copyFromTexture:s->tex sourceSlice:ss sourceLevel:a->srcLevel sourceOrigin:MTLOriginMake(a->srcX, a->srcY, 0) sourceSize:MTLSizeMake(a->w, a->h, 1)
+                         toTexture:dt->tex destinationSlice:ds destinationLevel:a->dstLevel destinationOrigin:MTLOriginMake(a->dstX, a->dstY, 0)];
             }
         }
         [b endEncoding]; g_n_blit++;
@@ -2059,11 +2191,13 @@ static void copy_image_sub_data(const char *what, GLuint srcName, GLenum srcTarg
 }
 GL(glCopyImageSubData, void, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
    GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei w, GLsizei h, GLsizei d) {
-    copy_image_sub_data("glCopyImageSubData", srcName, srcTarget, srcLevel, srcX, srcY, srcZ, dstName, dstTarget, dstLevel, dstX, dstY, dstZ, w, h, d);
+    copyimg_t a = {srcName, srcTarget, srcLevel, srcX, srcY, srcZ, dstName, dstTarget, dstLevel, dstX, dstY, dstZ, w, h, d};
+    copy_image_sub_data("glCopyImageSubData", &a);
 }
 GL(glCopyImageSubDataNV, void, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ,
    GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei w, GLsizei h, GLsizei d) {
-    copy_image_sub_data("glCopyImageSubDataNV", srcName, srcTarget, srcLevel, srcX, srcY, srcZ, dstName, dstTarget, dstLevel, dstX, dstY, dstZ, w, h, d);
+    copyimg_t a = {srcName, srcTarget, srcLevel, srcX, srcY, srcZ, dstName, dstTarget, dstLevel, dstX, dstY, dstZ, w, h, d};
+    copy_image_sub_data("glCopyImageSubDataNV", &a);
 }
 // Factorio 2.0.77 keeps its copy-image entry in a dispatch table at main+0x2e37260, filled from a weak import. Its loader never asked eglGetProcAddress for the name,
 // and the weak import bound to 0, so the 3D bitmap assembly calls address 0 even though the host now implements the function. Put the host function in that one slot.
