@@ -25,6 +25,8 @@ No `patches.py`: the game's own builds are untouched. Everything found so far is
 - **Compression on A16.** A16 has no BC hardware. DXT1/3/5, RGTC1/2 and BPTC uploads are decoded to RGBA8/R8/RG8 with `bcdec` instead of asking Metal for a format it rejects. The game's compression self-test still reports PSNR failures (the decoded texture has no compressed bytes to read back), but rendering continues.
 - **Factorio's copy-image dispatch slot.** The game fills `main+0x2e37260` from a weak `glCopyImageSubData` import and never asks `eglGetProcAddress` for it; the host writes its function there at the first 16³ 3D bitmap (gated on this build ID).
 - **Cutscene.** `glCopyTexSubImage2D/3D` copy the read framebuffer into the bound texture; the level intro uses the 3D form.
+- **Texture readback (the save preview).** Factorio renders the preview into 75/76/79, composites it into texture 74 (`game.frag`, sampling `gameview` = 75) and reads 74 with `glGetTexImage`. The read used a command buffer of its own, committed at once, while the frame's draws were still uncommitted: the queue ran the read first, so the preview was a solid `0xFF00FF` rectangle, and even 75 (hundreds of `sprite_light` draws) read as one colour. A client-visible read now commits and waits for the frame's command buffer first, as `glFinish` does. The preview is the game's own 960×540 capture; there is no host fallback.
+- **Buffer textures (biome and water edges).** `tiles.vert` and `tiles-lava-effect.vert` fetch each tile's mask coordinates from `maskTexCoordTable`, a `samplerBuffer`: the game fills a buffer object and attaches it with `glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, …)`. The layer implements `GL_TEXTURE_BUFFER` (and `glTexBufferRange`) as a Metal `texture_buffer` view over the GL buffer's own `MTLBuffer`, remade when the buffer object is reallocated. Before that `samplerBuffer` was not in the shader type table, the sampler was skipped at bind time and every `texelFetch` returned 0: tiles blended with the mask texel at 0 (hard biome edges) and the water surface never reached over the shore.
 
 ## Services and input
 
@@ -33,9 +35,8 @@ No `patches.py`: the game's own builds are untouched. Everything found so far is
 
 ## Open
 
-- `GL_TEXTURE_BUFFER` (`glBindBuffer(GL_TEXTURE_BUFFER)`, `glTexBuffer`) is not implemented. Factorio called it once during menu/level setup; the menu and gameplay continue without it.
-- The character shadow appears as a checkerboard that stretches with orientation. Untriaged: the `[shadow, alpha-mask]` atlases or the missing texture-buffer path are candidates.
-- The host reports the Switch's 256 MB save quota; Factorio warns that save space is low (`268435456/268435456`) even though the phone has free space. Saving has not been checked end to end.
+- The character shadow appears as a checkerboard that stretches with orientation. Untriaged: the `[shadow, alpha-mask]` atlases, or the depth / stencil state of the sprite pass.
+- The host reports the Switch's 256 MB save quota; Factorio warns that save space is low (`268435456/268435456`) even though the phone has free space. Saving itself works, preview included.
 
 ## Building
 
