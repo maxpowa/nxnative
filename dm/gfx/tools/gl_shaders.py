@@ -179,6 +179,16 @@ def translate(src, stage, key, tmp):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode: return 'spirv-cross: ' + r.stderr.strip()[:300]
     m = open(msl).read()
+    # Named uniform blocks: give each a Metal buffer slot of its own (the default block keeps its binding, usually 0) and rewrite spirv-cross's
+    # [[buffer(binding)]] declarations, since every GL block's SPIR-V binding may be 0 until glUniformBlockBinding says otherwise.
+    named = []
+    for u in refl.get('ubos', []):
+        t = refl['types'][u['type']]
+        if t['name'] != 'gl_DefaultUniformBlock': named.append((u, t))
+    for n, (u, t) in enumerate(named):
+        slot = n + 1
+        if slot > 13: return f'uniform blocks: more than 13 blocks in one shader'
+        m = re.sub(rf'(constant\s+{re.escape(t["name"])}\s*&\s*\w+\s*\[\[buffer\()\d+(\)\]\])', rf'\g<1>{slot}\g<2>', m)
     # Varyings by name: the out struct of a vertex shader and the in struct of a fragment shader (stage_in members of a vertex shader are [[attribute(n)]])
     m = re.sub(r'(\b(\w+)\s+\[\[)user\(locn\d+\)', lambda x: f'{x.group(1)}user({x.group(2)})', m)
     m = re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', m)   # a NaN operand gives the other one, as on the Switch's GPU (vk_shaders.py PRECISE)
@@ -192,7 +202,10 @@ def translate(src, stage, key, tmp):
     bools = {n for n in re.findall(r'\buniform\s+(?:(?:lowp|mediump|highp)\s+)?bool\s+(\w+)\s*;', pre)}
     for u in refl.get('ubos', []):
         t = refl['types'][u['type']]
-        if t['name'] != 'gl_DefaultUniformBlock': return f'uniform block {t["name"]} is not the default block'
+        if t['name'] != 'gl_DefaultUniformBlock':
+            slot = next(n + 1 for n, (x, y) in enumerate(named) if x is u)
+            f.append(f'B:{t["name"]}={slot}:{u["block_size"]}')
+            continue
         f.append(f'b:{u["binding"]}:{u["block_size"]}')
         e = uni_members(refl, t['members'], '', 0, f, bools)
         if e: return e
