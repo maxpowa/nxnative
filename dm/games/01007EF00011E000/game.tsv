@@ -48,6 +48,10 @@ mem_alias	0x10000000
 mem_stack	0x10000000
 app_pool	0xCD500000
 
+# BC textures decoded on a GPU without BC hardware: medium (one mip level less, a quarter of the memory) is the tested default on an A16; low (two) and lowest (three) are there for a
+# heavy scene that still does not fit. A GPU that samples BC natively keeps the game's textures as they are (the launcher hides the row)
+tex_quality	medium
+
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /Layout/=layout /System/=gsys /Terrain/=terrain
 shader_note	Breath of the Wild shaders

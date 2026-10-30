@@ -145,6 +145,15 @@ Built in the background while playing instead, the stand-ins took an iPhone 17 P
 - **When to change it:** turn it off if you don't want to wait at that first start.
 - **Cost:** on, a wait of a few minutes once. Off, no wait, but a pipeline seen for the first time makes the game stall briefly while it is built, until the archive holds it.
 
+### Texture quality
+
+Games whose textures the GPU cannot sample compressed — the Switch stores most of them as BC blocks, which A17 Pro and later GPUs read natively but A16 and older have to decode into memory — offer **Full**, **Medium**, **Low** and **Lowest**. Each step keeps one mip level less when the texture is decoded: Medium costs a quarter of the memory, Low a sixteenth and Lowest a sixty-fourth, at that much softer a picture. It is the difference between running and being killed for memory on a 6 GB phone: in Breath of the Wild, Low took the GPU's texture memory from about 3.1 GB to 1.7 GB, and the game that used to be killed after a minute of play runs.
+
+Games with no such textures, or on a phone that reads BC natively, do not show the row: the setting would change nothing there.
+
+- **When to change it:** leave it at the game's tested value; choose Full if you have memory to spare and want the textures exactly as the game stores them, or one step further down if a busy scene is still killed for memory.
+- **Cost:** lower steps are blurrier — in most scenes it reads as a slightly softer image rather than missing detail, since the game's own mip chains are what are being skipped.
+
 ### Encode thread
 
 The app turns the game's graphics commands into Metal commands on a thread of its own instead of the game's submitting thread, so the game's thread can go on sooner (in Breath of the Wild about 4 ms per frame instead of 8). Frame buffering needs it for games that present their frames from another thread than the one that draws them. It is on by default on the iPhone; on the Mac it is off, where it lowered the typical frame time but made the slowest frames slower.

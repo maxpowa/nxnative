@@ -2,6 +2,7 @@
 // from dm/games/settings.tsv (dm/games/settings.py): each sets an environment variable the host reads when the game starts. A variable an env file set (Documents/env.txt, the bundle's
 // dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. All settings share one screen, grouped by section (rows: LauncherRow.swift). Choices that differ from the game's default are kept
 // in UserDefaults; Reset to tested defaults shows the defaults, and Play then forgets them. DM_LAUNCHER=0 in Documents/env.txt starts the game at once with the saved choices; DM_SAVED_CHOICES=0 ignores them (and keeps them)
+import Metal
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -171,7 +172,13 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
     if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); LauncherModel(file.settings).applySaved(); return false }
     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
-    let model = LauncherModel(file.settings)
+    // a GPU that samples BC natively has no BC textures to decode: the rows only such a GPU needs stay out, so it keeps the game's own textures
+    let bc: Bool = {
+        guard let d = MTLCreateSystemDefaultDevice() else { return true }
+        if #available(iOS 16.4, *) { return d.supportsBCTextureCompression }
+        return false
+    }()
+    let model = LauncherModel(file.settings, noBC: !bc)
     var host: UIViewController?
     let view = LauncherView(m: model) {
         guard let h = host else { return }

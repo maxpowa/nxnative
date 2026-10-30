@@ -70,6 +70,7 @@ def build(gid, patched, control):
 
     def shown(cond, n):
         if cond == 'always': return True
+        if cond == 'bc': return True   # runtime: the front end drops the row on a GPU that samples BC, where it has nothing to do (the switch stays unset, the game untouched)
         if cond == 'languages>1': return len(langs) > 1
         if cond.startswith('fixups:'): return cond[7:] in keys
         if cond.startswith('gfxapi:'): return os.environ.get('GFXAPI', '') == cond[7:]
@@ -104,6 +105,7 @@ def build(gid, patched, control):
             if can is not None and want not in can: sys.exit(f'settings.tsv:{n}: needs a value {need} never takes: {want} (it takes {", ".join(sorted(can))})')
         if not shown(cond, n): continue
         s = {'env': var, 'kind': kind, 'section': section, 'label': label, 'note': note, 'default': value(default, n), **m}
+        if cond == 'bc': s['no_bc'] = True   # a setting only a GPU without BC has anything to do with
         if var == 'DM_RENDER_SCALE' and base: s['base'] = base   # the render scale in pixels, for the console mode chosen
         if kind == 'choice':
             opts = [list(l) for l in langs] if values == 'languages' else [v.split('=', 1) for v in values.split(',')]
