@@ -27,8 +27,9 @@ static inline int dm_host_thread_join(pthread_t thread, void **result) {
     return r;
 }
 
-// The message and its newline under one stream lock: written apart, another thread's line could land between them and two messages share a log line
-#define LOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] " __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } while (0)
+// The message and its newline under one stream lock: written apart, another thread's line could land between them and two messages share a log line. Flush every line: a
+// signal or a SIGKILL (code signing, the watchdog) would otherwise lose the last block, which is exactly the line a bring-up crash needs
+#define LOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); funlockfile(stderr); } while (0)
 #define die(...) do { LOG("FATAL " __VA_ARGS__); abort(); } while (0)
 
 typedef struct { uint32_t st_name; uint8_t st_info, st_other; uint16_t st_shndx; uint64_t st_value, st_size; } Elf64_Sym;
@@ -90,7 +91,8 @@ void nro_load(module_t *m);     // relocate an NRO against the loaded modules an
 void nro_unload(module_t *m);   // take an NRO out of the lookups and bind the imports that pointed into it again
 int svc_nro_deactivate(module_t *m);   // mark inactive under the memory map lock, refusing while a stack borrows its data
 void *module_sym(module_t *m, const char *name);
-int dm_sdk_major(void);   // SDK major version from the sdk module's version string (loader.c); 0 = unknown
+int dm_sdk_major(void);   // SDK major version from the SDK modules' version string (loader.c); 0 = unknown
+int dm_sdk_modules(module_t **out, int max);   // the modules holding Nintendo's SDK, sdk first, then subsdk0, subsdk1, ... (30XX ships no sdk, its SDK is in subsdk0) (loader.c)
 #define DM_SDK_OLD(major) ((major) > 0 && (major) <= 10)   // SDK 10 and older: NVN API 53, the shared-font address points at the TTF itself
 int dm_main_imports(const char *prefix);   // main imports a symbol whose name starts with prefix (loader.c)
 void *guest_sym(const char *name);
