@@ -148,6 +148,10 @@ static id<MTLCommandBuffer> g_cb;
 static id<MTLRenderCommandEncoder> g_enc;
 static _Atomic uint64_t g_n_draw, g_n_pass, g_n_up, g_n_blit, g_n_pso, g_n_cb;
 static _Atomic uint64_t g_sk_prog, g_sk_pass, g_sk_attr, g_sk_pso;   // draws dropped in draw_setup, by reason
+static uint64_t g_frames;
+static uint8_t g_drawn_tex[1 << 16];            // textures that have been a colour attachment of a draw (DM_GL_WATER_LOG)
+static uint32_t g_drawn_frame[1 << 16];         // the frame of that draw, so a per-frame read can tell a stale target
+static GLuint g_water_mask, g_water_noise; static uint32_t g_water_frames;
 
 // ---------- Shader table (<DM_MSL_DIR>/gl/gl_shaders.tsv) ----------
 enum { T_FLOAT, T_VEC2, T_VEC3, T_VEC4, T_INT, T_IVEC2, T_IVEC3, T_IVEC4, T_UINT, T_UVEC2, T_UVEC3, T_UVEC4, T_BOOL, T_MAT2, T_MAT3, T_MAT4,
@@ -221,7 +225,8 @@ static void dev_init_once(void) {
         g_log = getenv("DM_GL_LOG") && atoi(getenv("DM_GL_LOG"));
         g_dev = (__bridge id<MTLDevice>)mtl_device_classic();
         g_bc = [g_dev supportsBCTextureCompression];
-        GLOG("BC texture compression: %s", g_bc ? "yes" : "no (compressed uploads are decoded to RGBA8/R8)");
+        if (getenv("DM_GL_NO_BC")) g_bc = 0;   // development: take the A16 path (decode compressed uploads) on a device that has BC, to compare the two
+        GLOG("BC texture compression: %s%s", g_bc ? "yes" : "no (compressed uploads are decoded to RGBA8/R8)", getenv("DM_GL_NO_BC") ? " (DM_GL_NO_BC)" : "");
         g_q = [g_dev newCommandQueueWithMaxCommandBufferCount:64]; g_q.label = @"gl";
         g_ev = [g_dev newSharedEvent];
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -631,10 +636,18 @@ static void *pixels_convert(const void *src, uint32_t w, uint32_t h, GLenum form
     if (cv == CV_565 || cv == CV_4444 || cv == CV_5551) { comps = 1; tbytes = 2; }
     size_t sp = (size_t)(S.unpack_row ? S.unpack_row : w) * comps * tbytes; sp = (sp + S.unpack_align - 1) / S.unpack_align * S.unpack_align;
     const uint8_t *s = src;
+    int dbytes = g_fmt[f].bytes, sbytes = comps * tbytes;   // per-pixel bytes of the texture and of the given data
     for (uint32_t y = 0; y < h; y++, s += sp) {
         uint8_t *d = dst + y * dp;
         switch (cv) {
-            case CV_COPY: memcpy(d, s, umin((uint32_t)dp, (uint32_t)((size_t)w * comps * tbytes))); break;
+            // A copy between different component counts is per pixel, as GL converts: an RGBA source into an R8 texture keeps each pixel's red channel, not the
+            // first quarter of the row (which is what a row memcpy gives, and what turned Factorio's uncompressed masks and water noise into static on A16)
+            case CV_COPY:
+                if (dbytes == sbytes) memcpy(d, s, (size_t)w * dbytes);
+                else if (dbytes < sbytes) for (uint32_t x = 0; x < w; x++) memcpy(d + (size_t)x * dbytes, s + (size_t)x * sbytes, (size_t)dbytes);
+                else for (uint32_t x = 0; x < w; x++) { uint8_t *q = d + (size_t)x * dbytes; memset(q, 0, (size_t)dbytes);
+                        for (int c = 0; c < sbytes; c++) q[c] = s[(size_t)x * sbytes + c]; q[3] = 255; }
+                break;
             case CV_SWAP_RB: for (uint32_t x = 0; x < w; x++) { d[4 * x] = s[4 * x + 2]; d[4 * x + 1] = s[4 * x + 1]; d[4 * x + 2] = s[4 * x]; d[4 * x + 3] = s[4 * x + 3]; } break;
             case CV_RGB8: for (uint32_t x = 0; x < w; x++) { d[4 * x] = s[3 * x]; d[4 * x + 1] = s[3 * x + 1]; d[4 * x + 2] = s[3 * x + 2]; d[4 * x + 3] = 255; } break;
             case CV_565: for (uint32_t x = 0; x < w; x++) { uint16_t v; memcpy(&v, s + 2 * x, 2); d[4 * x] = (v >> 11) * 255 / 31; d[4 * x + 1] = (v >> 5 & 63) * 255 / 63; d[4 * x + 2] = (v & 31) * 255 / 31; d[4 * x + 3] = 255; } break;
@@ -1329,6 +1342,28 @@ static int draw_setup(void) {
     }
     bind_uniforms_textures(p);
     g_n_draw++;
+    { fb_t *f = fb_of(S.fb); if (f) for (int i = 0; i < MAXCOL; i++) if (f->col[i].kind == 1) { g_drawn_tex[f->col[i].name & 0xffff] = 1; g_drawn_frame[f->col[i].name & 0xffff] = (uint32_t)g_frames; } }
+    // DM_GL_WATER_LOG=1: the water effect's inputs. tiles-water-effect.frag reads mask = texelFetch(waterMaskTexture, ivec2(gl_FragCoord.xy)), so that texture must be a
+    // screen-sized target an earlier pass drew into; an unrendered one reads undefined memory, a fine noise over the whole water surface.
+    { static int on = -1; if (on < 0) on = getenv("DM_GL_WATER_LOG") != NULL;
+      if (on && !strcmp(p->si[1]->key, "c8be8473ef053a2d")) { static int n; if (n++ % 60 == 0) {
+        char line[700]; size_t o = 0; fb_t *f = fb_of(S.fb);
+        if (f) for (int i = 0; i < MAXCOL; i++) if (f->col[i].kind == 1) o += (size_t)snprintf(line + o, sizeof line - o, "%satt %d: tex %u", o ? ", " : "", i, f->col[i].name);
+        GLOG("water draw %d: fb %u %ux%u, %s", n, S.fb, P.w, P.h, line);
+        o = 0;
+        for (int i = 0; i < p->nu; i++) { const puni_t *u = &p->u[i]; if (!is_samp(u->type)) continue;
+            int unit = u->unit < 0 || u->unit >= NUNITS ? 0 : u->unit;
+            GLenum target = u->type == T_SAMPCUBE ? GL_TEXTURE_CUBE_MAP : u->type == T_SAMP3D ? GL_TEXTURE_3D : u->type == T_SAMP2DARR ? GL_TEXTURE_2D_ARRAY
+                          : is_buf_samp(u->type) ? GL_TEXTURE_BUFFER : GL_TEXTURE_2D;
+            GLuint tn = *unit_slot(unit, target); tex_t *t = tex_of(tn);
+            samp_t *so = samp_of(S.sampler[unit]);
+            o += (size_t)snprintf(line + o, sizeof line - o, "%s%s(u%d) tex %u", o ? ", " : "", u->name, unit, tn);
+            if (t) { o += (size_t)snprintf(line + o, sizeof line - o, " %ux%u %s lv%d min %#x mag %#x wrap %#x/%#x%s, drawn in frame %u",
+                        t->w, t->h, g_fmt[t->fmt].name, t->levels, so ? so->minf : t->minf, so ? so->magf : t->magf,
+                        so ? so->ws : t->ws, so ? so->wt : t->wt, so ? " (object)" : "", g_drawn_frame[tn & 0xffff]);
+                     if (!strcmp(u->name, "waterMaskTexture")) { g_water_mask = tn; g_water_frames = g_drawn_frame[tn & 0xffff]; }
+                     if (!strcmp(u->name, "waterNoiseTexture")) g_water_noise = tn; } }
+        GLOG("water samplers: %s", line); } } }
     if ((P.w == 960 && P.h == 540) || (P.w == 1920 && P.h == 1080)) { static int n; if (n++ < 60) GLOG("draw %dx%d: framebuffer %u program %u attachments %d", P.w, P.h, S.fb, S.prog, P.ncol); }
     // DM_GL_DRAWLOG=<n>[:<seconds>]: the first n draws after <seconds> of run time (default 0) with their target, viewport, scissor box and program
     // (a port's first question is where its draws go: a picture that stays black while the game keeps drawing is usually a target or a viewport, not a shader)
@@ -1907,16 +1942,28 @@ static void teximg_impl(const teximg_args *a) __attribute__((used));
 BIGSTUB(teximg_impl);
 static void teximg_impl(const teximg_args *a0) {
     teximg_args a1 = *a0; a1.pixels = unpack_src(a0->pixels); const teximg_args *a = &a1;
+    // DM_GL_WATER_LOG=1: the uploads at the water noise texture's size (512x512), to see which format the game picks with and without BC
+    { static int on = -1; if (on < 0) on = getenv("DM_GL_WATER_LOG") != NULL;
+      static int n; if (on && n < 10 && a->w == 512 && a->h == 512) { n++;
+        GLOG("512x512 upload: %s%s level %d ifmt %#x format %#x type %#x size %d pixels %p", a->sub ? "sub" : "image", a->compressed ? " compressed" : "", a->level, a->ifmt, a->format, a->type, a->size, a->pixels); } }
     @autoreleasepool {
         if (a->sub) {
             tex_t *t = bound_tex(a->target);
             int face = a->target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && a->target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(a->target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
             if (!t || t->fmt < 0 || a->w <= 0 || a->h <= 0) return;
             int f = t->fmt, cv = CV_COPY;   // the data is converted to the texture's format
-            if (f == F_RGBA8) cv = a->type == GL_UNSIGNED_SHORT_5_6_5 ? CV_565 : a->type == GL_UNSIGNED_SHORT_4_4_4_4 ? CV_4444 : a->type == GL_UNSIGNED_SHORT_5_5_5_1 ? CV_5551 :
+            if (a->compressed) {
+                // glCompressedTexSubImage2D: blocks for a sub-rect, decoded as the image upload decodes them. Factorio creates these textures with
+                // glTexImage2D(BC4/BC3, NULL) and then sends the blocks this way; reading them as pixels is what turned its water noise and alpha masks into
+                // static on the no-BC path (a device that samples BC never takes it)
+                if (t->bc < CV_BC1) { RED1("glCompressedTexSubImage2D into a %s texture", g_fmt[f].name); return; }
+                size_t need = bc_src_size(t->bc, a->w, a->h);
+                if ((size_t)a->size < need) { RED1("glCompressedTexSubImage2D: %d bytes for %dx%d %s (%zu expected)", a->size, a->w, a->h, g_fmt[f].name, need); return; }
+                cv = t->bc;
+            } else if (f == F_RGBA8) cv = a->type == GL_UNSIGNED_SHORT_5_6_5 ? CV_565 : a->type == GL_UNSIGNED_SHORT_4_4_4_4 ? CV_4444 : a->type == GL_UNSIGNED_SHORT_5_5_5_1 ? CV_5551 :
                                    a->format == GL_RGB ? CV_RGB8 : a->format == GL_COLOR_INDEX ? CV_INDEX : CV_COPY;
             // BGRA bytes into an RGBA texture (30XX: glTexStorage2D(RGBA8), then glTexSubImage2D(BGRA)), or RGBA into one made from BGRA data: red and blue swapped on the way
-            if (a->type == GL_UNSIGNED_BYTE && (((f == F_RGBA8 || f == F_SRGBA8) && a->format == GL_BGRA) || (f == F_BGRA8 && a->format == GL_RGBA))) cv = CV_SWAP_RB;
+            if (!a->compressed && a->type == GL_UNSIGNED_BYTE && (((f == F_RGBA8 || f == F_SRGBA8) && a->format == GL_BGRA) || (f == F_BGRA8 && a->format == GL_RGBA))) cv = CV_SWAP_RB;
             size_t pitch; void *conv = pixels_convert(a->pixels, a->w, a->h, a->format, a->type, f, cv, &pitch);
             if (!t->made) {   // into a level not made yet: patch the pending copy
                 level_t *l = &t->pend[face][a->level < MAXLV ? a->level : 0];
@@ -2717,7 +2764,33 @@ GL(glGetUniformuiv, void, GLuint pr, GLint loc, GLuint *v) { uni_read(pr, loc, v
 static struct { int init; int surface; uint32_t w, h; } g_egl;
 static uint64_t g_frames;
 // Every 300 frames: draws, passes, uploads; every 1800: memory (the process footprint, Metal's allocations, the GL objects alive), as the NVN layer's memory report
+// DM_GL_WATER_LOG=1: the centre 16x16 of a texture the water shader samples, channel 0. Smooth coverage means the pass ran; a spread of values in a tiny patch means
+// the shader is reading something it never should (an unrendered surface, or a texture with no mip chain sampled while minified).
+static void dump_tex16(const char *what, GLuint name, uint32_t drawn) {
+    tex_t *t = tex_of(name);
+    if (!t || !t->tex || (t->tex.pixelFormat != MTLPixelFormatR8Unorm && t->tex.pixelFormat != MTLPixelFormatRGBA8Unorm)) return;
+    @autoreleasepool {
+        id<MTLTexture> tx = t->tex; NSUInteger w = umin(16u, tx.width), h = umin(16u, tx.height);
+        id<MTLBuffer> b = [g_dev newBufferWithLength:64 * h options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [g_q commandBuffer]; cb.label = @"gl water dump";
+        id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+        [e copyFromTexture:tx sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(tx.width / 2 - w / 2, tx.height / 2 - h / 2, 0)
+                sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:0 destinationBytesPerRow:64 destinationBytesPerImage:64 * h];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted]; g_n_blit++;
+        const uint8_t *p = b.contents; int step = tx.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4;
+        int mn = 255, mx = 0, nd = 0; uint8_t seen[16];
+        for (NSUInteger i = 0; i < w * h; i++) { uint8_t v = p[i * step]; if (v < mn) mn = v; if (v > mx) mx = v;
+            int k; for (k = 0; k < nd; k++) if (seen[k] == v) break; if (k == nd && nd < 16) seen[nd++] = v; }
+        GLOG("%s %u: %ux%u %s, drawn in frame %u (now %llu), centre %ux%u channel 0 min %d max %d, %d distinct value%s", what, name,
+             (unsigned)tx.width, (unsigned)tx.height, tx.pixelFormat == MTLPixelFormatR8Unorm ? "R8" : "RGBA8", drawn,
+             (unsigned long long)g_frames, (unsigned)w, (unsigned)h, mn, mx, nd, nd == 1 ? "" : "s");
+    }
+}
 static void frame_end(void) {
+    // DM_GL_WATER_LOG=1: a few texels of the screen-sized texture the water shader reads per pixel (waterMaskTexture), once every 60 frames. Smooth coverage means the
+    // mask pass ran; noise means the shader reads a surface that was never rendered, or one rendered at another size.
+    { static int on = -1; if (on < 0) on = getenv("DM_GL_WATER_LOG") != NULL;
+      if (on && g_frames % 60 == 0) { dump_tex16("water mask", g_water_mask, g_water_frames); dump_tex16("water noise", g_water_noise, 0); } }
     static uint64_t pd, pp, pu, pb, pc;
     uint64_t f = ++g_frames, dr = g_n_draw, pa = g_n_pass, up = g_n_up, bl = g_n_blit, cb = g_n_cb;
     uint64_t sp = g_sk_prog, sq = g_sk_pass, sa = g_sk_attr, so = g_sk_pso;
