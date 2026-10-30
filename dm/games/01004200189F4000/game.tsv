@@ -21,6 +21,11 @@ modules	main sdk
 romfs_marker	data/core/fonts/NotoSansCJKsc-Bold.ttf
 zip_store	.dat:.ogg:.png:.ttf:.zip:.metallib
 
+# ---- Display / input ----
+# Handheld by default: Factorio's free cursor moves with the right stick and can be jumped by tapping, but the host sends touch points only in handheld mode
+# (the Switch's screen is out of reach when docked). The launcher's Console mode still overrides this per launch.
+op_mode	handheld
+
 # ---- Memory ----
 # main sets a heap of at most the pool − 64 MB: a 3328 MB heap region
 mem_reserve	0x100000000
