@@ -7,6 +7,7 @@
 import AppKit
 import AVFAudio
 import CoreAudio
+import Metal
 import QuartzCore
 import SwiftUI
 
@@ -471,7 +472,12 @@ public func dmMacLauncher() -> Int32 {
         fputs("launcher: settings window off (hold Option at launch to show it)\n", stderr)
         return SaveCheck.withoutWindow() ? 2 : 0
     }
-    let model = LauncherModel(file.settings)
+    let bc: Bool = {
+        guard let d = MTLCreateSystemDefaultDevice() else { return true }
+        if #available(macOS 13.0, *) { return d.supportsBCTextureCompression }
+        return false
+    }()
+    let model = LauncherModel(file.settings, noBC: !bc)
     let app = NSApplication.shared, launcher = Launcher(model)
     app.setActivationPolicy(.regular)
     app.delegate = launcher
