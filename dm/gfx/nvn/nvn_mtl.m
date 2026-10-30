@@ -1868,6 +1868,26 @@ static int no_bc(void) {
     return v;
 }
 static int bc_unpack(uint32_t nvn_fmt, uint32_t *pf, int *bpp) { return no_bc() && nvn_bc_unpacked(nvn_fmt, pf, bpp); }
+// DM_TEX_QUALITY=medium|low|lowest (a GPU without BC only): a packaged BC1/BC3/BC5/BC7 texture is created one, two or three mip levels smaller, and its content is decoded from
+// that level upwards — the finest levels are never decoded, so the decoded texture costs a quarter, a sixteenth or a sixty-fourth of its memory and the image is that many mip
+// levels softer. The game still samples it with the same normalized coordinates; only the stored resolution changes.
+int nvn_sparse_pool(const void *pool);   // defined below (sparse pools): their views are anchored to a level, so their textures keep every level
+static int tq_k(const tex_t *t) {
+    static int q = -1;
+    if (q < 0) { const char *e = getenv("DM_TEX_QUALITY");
+        q = !e || !*e ? 0 : !strcmp(e, "medium") || !strcmp(e, "half") ? 1 : !strcmp(e, "low") || !strcmp(e, "quarter") ? 2 : !strcmp(e, "lowest") ? 3 : 0;
+        if (e && *e && !q) MLOG("[RED] DM_TEX_QUALITY takes medium, low or lowest: %s", e);
+        if (q) MLOG("texture quality: %s: BC textures are decoded from mip %d upwards", q == 1 ? "medium" : q == 2 ? "low" : "lowest", q); }
+    if (!q || !no_bc()) return 0;
+    uint32_t pf; int bpp; if (!nvn_bc_unpacked(t->d.format, &pf, &bpp)) return 0;   // not a block-compressed texture
+    int sp = t->pool && nvn_sparse_pool(t->pool);
+    // 2D (NVN_TEXTURE_TARGET_2D = 1), 2D array and cube textures: the level shift is a plain resize. Sparse pools are left out for now: their sampled view is anchored to a
+    // level by the guest's level offsets.
+    int shape_ok = t->d.target == 1 || t->d.target == 4 || t->d.target == 8;
+    // A step asks for up to q levels fewer, and always keeps one: a texture with fewer levels than the step takes as many as it has (lowest on a 3-level texture is low)
+    int drop = (int)t->d.levels - 1; if (drop > q) drop = q;
+    return !shape_ok || sp || drop < 1 ? 0 : drop;
+}
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
@@ -1878,6 +1898,8 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     d.pixelFormat = (MTLPixelFormat)pf;
     d.width = t->d.width ? t->d.width : 1; d.height = t->d.height ? t->d.height : 1; d.depth = 1; d.arrayLength = 1;
     d.mipmapLevelCount = t->d.levels ? t->d.levels : 1;
+    int tqk = packaged ? tq_k(t) : 0;   // no BC + DM_TEX_QUALITY: one or two mip levels are not kept (see tq_k)
+    if (tqk) { d.width = MAX(d.width >> tqk, 1u); d.height = MAX(d.height >> tqk, 1u); d.mipmapLevelCount = MAX(d.mipmapLevelCount - tqk, 1u); }
     switch (t->d.target) {
         // 1D / 1D array are created as one-row 2D / 2D array textures: translated shaders never declare texture1d (0 in all five games' libraries) and always sample them as 2D; a Metal 1D texture bound to a texture2d argument is a type mismatch with undefined reads.
         // Super Mario 3D World + Bowser's Fury's material shaders sample 64x1 R32F 1D lookup tables heavily every frame (on Maxwell a 2D sample of a 1D texture reads that one row)
@@ -2324,19 +2346,21 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     if (stamp) {   // no stamp: a one-time upload of content the CPU will not change (tex_init_fill), with no write tracking
         *stamp = nvn_dirty_now();
         if (sparse) nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); else nvn_dirty_protect(t->mem, t->L.size); }
+    int tqk = tq_k(t);   // no BC + DM_TEX_QUALITY: target level l holds the game's level l+tqk
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // a cube array's depth counts layer-faces (tex_desc)
     uint32_t upf; int ubpp = 0, unp = bc_unpack(t->d.format, &upf, &ubpp);   // no BC: decode after deswizzling, with the staging area sized for the decompressed data
     size_t total = 0;
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
-        uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
+        unsigned gl = l + tqk;
+        uint32_t w = MAX(t->d.width >> gl, 1u), h = MAX(t->d.height >> gl, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> gl, 1u) : 1;
         total += unp ? (size_t)w * ubpp * h * z * layers : (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * layers;
     }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
     int gdec = unp && t->d.target != 2 && bcd_fmt(t->d.format) && bcd_pso();   // BC1-5 without BC: GPU deswizzle + GPU decompression
     size_t ctotal = 0;   // staging size of the compressed blocks when they are decompressed on the GPU
-    if (gdec) for (unsigned l = 0; l < d.mipmapLevelCount; l++) { uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u); ctotal += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * layers; }
+    if (gdec) for (unsigned l = 0; l < d.mipmapLevelCount; l++) { unsigned gl = l + tqk; uint32_t w = MAX(t->d.width >> gl, 1u), h = MAX(t->d.height >> gl, 1u); ctotal += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * layers; }
     int use_gpu = (!unp || gdec) && !rb_shift && !sparse && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
     if (g_nvn_deswz_gpu && !use_gpu && !sparse && !rb_shift && !unp) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
@@ -2362,11 +2386,12 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         id<MTLBuffer> stg = up_alloc(gdec ? ctotal : total ? total : 16, &stg_off);
         size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits, nd0 = g_nup_decs;
         for (unsigned l = 0; enc_ok && l < d.mipmapLevelCount; l++) {
-            uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
+            unsigned gl = l + tqk;
+            uint32_t w = MAX(t->d.width >> gl, 1u), h = MAX(t->d.height >> gl, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> gl, 1u) : 1;
             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
             for (unsigned y = 0; y < layers; y++) {
                 size_t poff; id<MTLBuffer> params = up_param_alloc(&poff);   // Metal 4 has no setBytes: the parameter block of each deswizzle is cut from a shared block (no new GPU buffer each time)
-                if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, l, y, stg, stg_off + off, pitch)) { enc_ok = 0; break; }
+                if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, gl, y, stg, stg_off + off, pitch)) { enc_ok = 0; break; }
                 if (gdec) {   // Decompression job: dispatched at flush time after the barrier (see up_flush)
                     MTLPixelFormat vf = mt.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm : mt.pixelFormat;
                     id<MTLTexture> v = [mt newTextureViewWithPixelFormat:vf textureType:MTLTextureType2D levels:NSMakeRange(l, 1) slices:NSMakeRange(y, 1)];
@@ -2402,19 +2427,20 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     size_t off = 0;
     int zb = zblock_on() && t->d.format >= 0x79 && t->d.format <= 0x94; if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
-        uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
+        unsigned gl = l + tqk;
+        uint32_t w = MAX(t->d.width >> gl, 1u), h = MAX(t->d.height >> gl, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> gl, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < layers; y++) {
             if (unp) {   // no BC: deswizzle the compressed blocks, then decode them into the staging area
                 uint8_t *cb = malloc(pitch * rows * z); size_t up = (size_t)w * ubpp;
-                if (!cb || nvn_deswizzle(&t->d, l, y, src, cb, pitch)) { free(cb); RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
+                if (!cb || nvn_deswizzle(&t->d, gl, y, src, cb, pitch)) { free(cb); RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
                 for (uint32_t zi = 0; zi < z; zi++) nvn_bc_decode(t->d.format, cb + zi * pitch * rows, pitch, w, h, (uint8_t *)stg.contents + off + zi * up * h, up);
                 free(cb);
                 up_blit_add(stg, off, up, up * h, MTLSizeMake(w, h, z), mt, y, l);
                 off += up * h * z;
                 continue;
             }
-            if (nvn_deswizzle(&t->d, l, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
+            if (nvn_deswizzle(&t->d, gl, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
             if (rb_shift) rb_swap_rows((uint8_t *)stg.contents + off, pitch, rows, z, pitch, pitch * rows, rb_shift);
             if (zb && l < 16) { const uint64_t *q = (const uint64_t *)((const uint8_t *)stg.contents + off); size_t nb = pitch * rows * z / 16;
                 for (size_t i = 0; i < nb; i++) g_zb[l] += !(q[2 * i] | q[2 * i + 1]);
