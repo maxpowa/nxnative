@@ -552,6 +552,16 @@ HLE_FORCE("_ZN2nn2fs26GetUtf16EntryNameLengthMaxEPbPmPKc", "fsp-srv; host mounts
 HLE_FORCE("_ZN2nn2fs21MountTemporaryStorageEPKc", "fsp-srv; temporary storage → host directory", Result, h_fs_MountTemp, const char *name) {
     char b[1024]; return mount(name, envdir("DM_TEMP", "run/platform/temp", b, sizeof b), 0);
 }
+// RamDisk: the SDK's in-memory filesystem (nn::fs::RamDiskFileSystem) is replaced by a host directory under the temporary storage. Factorio calls GetRamDiskBufferSize,
+// allocates the buffer, MountRamDisk("ramdisk", ...), then creates ramdisk:/currently-playing and writes blueprint.dat there; without the mount every such open is ENOENT.
+HLE_FORCE("_ZN2nn2fs20GetRamDiskBufferSizeEPm", "fsp-srv; ramdisk buffer: a host directory needs none, report a single reasonable size", Result, h_fs_GetRamDiskSize, size_t *out) {
+    if (out) *out = 64 << 20; return RES_OK;
+}
+HLE_FORCE("_ZN2nn2fs12MountRamDiskEPKcPvm", "fsp-srv; ramdisk → host directory under temporary storage", Result, h_fs_MountRamDisk, const char *name, void *buf, size_t sz) {
+    (void)buf; (void)sz;
+    char t[1024], dir[1100]; snprintf(dir, sizeof dir, "%s/ramdisk", envdir("DM_TEMP", "run/platform/temp", t, sizeof t)); mkdir(dir, 0755);
+    return mount(name, dir, 0);
+}
 // Cache storage (Tears of the Kingdom; its first list call opened fsp-srv and aborted in sm::Initialize): storage <index> is the host folder <temporary storage>_cache<index>,
 // created when it is created or mounted. The list reports none (a fresh console), so the game creates its storage at every boot; creating an existing one succeeds
 static const char *cache_dir(int index, char *b, size_t n) { char t[1024]; snprintf(b, n, "%s_cache%d", envdir("DM_TEMP", "run/platform/temp", t, sizeof t), index); return b; }

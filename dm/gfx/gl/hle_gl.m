@@ -36,7 +36,7 @@ void dm_vi_layer_size(int *w, int *h);   // hle_vi.c: the size of the last sized
 #define RED1(...) do { static int once_; if (!once_) { once_ = 1; LOG("[gl] [RED] " __VA_ARGS__); } } while (0)
 static int g_trace3d;   // the 3D bitmap phase began: log the GL calls that follow
 static void patch_copy_image_slot(void);
-#define TLOG(...) do { if (g_trace3d) GLOG(__VA_ARGS__); } while (0)
+#define TLOG(...) do { if (g_trace3d > 0) GLOG(__VA_ARGS__); } while (0)
 static int g_log;
 static int g_bc;   // the Metal device supports BC texture compression (A16 does not: compressed uploads are decoded)
 #define OLOG(...) do { if (g_log) GLOG(__VA_ARGS__); } while (0)
@@ -810,7 +810,11 @@ static int tex_make(tex_t *t, int rt) {
     if (t->made) return t->tex != nil;
     if (t->fmt < 0 || !t->w || !t->h) return 0;
     int faces = tex_faces(t), lv = 0, vol = t->target == GL_TEXTURE_3D, arr = t->target == GL_TEXTURE_2D_ARRAY;
-    if (vol && t->w == 16 && t->h == 16 && t->d == 16 && !g_trace3d) { g_trace3d = 1; GLOG("GL trace: 3D bitmap phase"); patch_copy_image_slot(); }
+    if (vol && t->w == 16 && t->h == 16 && t->d == 16 && !g_trace3d) {
+        patch_copy_image_slot();
+        if (getenv("DM_GL_TRACE")) { g_trace3d = 1; GLOG("GL trace: 3D bitmap phase"); }
+        else g_trace3d = -1;   // phase entered, tracing off: do not re-enter
+    }
     uint32_t full = 1; for (uint32_t m = umax(umax(t->w, t->h), vol ? t->d : 1); m > 1; m >>= 1) full++;
     if (t->slevels) lv = (int)umin(umin((uint32_t)t->slevels, full), MAXLV);
     else { while (lv < MAXLV && lv < (int)full && (t->defined >> lv & 1)) lv++; if (!lv) lv = 1; }
@@ -2147,6 +2151,32 @@ static void blit_impl(const blit_args *a) {
                  toTexture:dst destinationSlice:ds destinationLevel:dl destinationOrigin:MTLOriginMake(a->d[0], a->d[1], 0)];
         [b endEncoding]; g_n_blit++;
     }
+}
+// glCopyTexSubImage2D/3D: copy from the read framebuffer's colour image into the bound texture. Factorio uses the 3D form for the level-intro/cutscene
+// frames (15 calls right after level.dat loads); without it those frames stay black. Metal copies only between matching pixel formats, so a format change is
+// reported rather than silently producing garbage.
+static void copy_tex_from_fb(GLenum target, GLint level, GLint xoff, GLint yoff, GLint zoff, GLint x, GLint y, GLsizei w, GLsizei h) {
+    tex_t *d = bound_tex(target);
+    if (!d || w <= 0 || h <= 0) { RED1("glCopyTexSubImage: no destination texture (%dx%d)", w, h); return; }
+    if (!d->made && !tex_make(d, 0)) return;
+    if (!d->tex) return;
+    int sl = 0, ss = 0; id<MTLTexture> s = fb_color(S.read_fb, &sl, &ss);
+    if (!s) return;
+    if (s.pixelFormat != d->tex.pixelFormat) { RED1("glCopyTexSubImage: framebuffer and %s texture formats differ", g_fmt[d->fmt].name); return; }
+    @autoreleasepool {
+        pass_end();
+        id<MTLCommandBuffer> cb = cb_get();
+        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        [b copyFromTexture:s sourceSlice:ss sourceLevel:sl sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
+                 toTexture:d->tex destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(xoff, yoff, target == GL_TEXTURE_3D ? zoff : 0)];
+        [b endEncoding]; g_n_blit++;
+    }
+}
+GL(glCopyTexSubImage3D, void, GLenum target, GLint level, GLint xoff, GLint yoff, GLint zoff, GLint x, GLint y, GLsizei w, GLsizei h) {
+    copy_tex_from_fb(target, level, xoff, yoff, zoff, x, y, w, h);
+}
+GL(glCopyTexSubImage2D, void, GLenum target, GLint level, GLint xoff, GLint yoff, GLint x, GLint y, GLsizei w, GLsizei h) {
+    copy_tex_from_fb(target, level, xoff, yoff, 0, x, y, w, h);
 }
 GL(glBlitFramebuffer, void, GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1, uint64_t mask, uint64_t filter) {
     (void)filter; blit_args a = {{sx0, sy0, sx1, sy1}, {dx0, dy0, dx1, dy1}, (GLbitfield)mask}; ((void (*)(const blit_args *))(const void *)blit_impl_bs)(&a);
