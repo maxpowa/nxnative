@@ -9,6 +9,7 @@ struct Setting: Decodable, Identifiable {
     let level: String?     // "basic": shown first (the Mac window's Basic settings); any other or none: Advanced settings. The iPhone keeps one list
     let base: Base?        // render scale: the 3D views' size at 1.0, docked and handheld, for the size in pixels (the Mac window)
     struct Base: Decodable { let docked, handheld: [Int] }
+    let no_bc: Bool?   // only a GPU that samples no BC has anything to do with it: a launcher drops the row where BC is native, leaving the switch unset
     let options: [[String]]?   // choice: [value, label]
     let min, max, step: Double?   // range
     let on, off: String?   // toggle: the values the variable takes (1 / 0 when not given)
@@ -30,7 +31,7 @@ struct Setting: Decodable, Identifiable {
         default: return true
         }
     }
-    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, needs, level, base, options, min, max, step, on, off }
+    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, needs, level, base, options, min, max, step, on, off, no_bc }
 }
 struct SettingsFile: Decodable { let settings: [Setting] }
 
@@ -43,9 +44,10 @@ final class LauncherModel: ObservableObject {
 
     private let defaults: UserDefaults
 
-    init(_ settings: [Setting], defaults: UserDefaults = .standard) {
+    init(_ settings: [Setting], noBC: Bool = true, defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.settings = settings
+        // a row only a GPU without BC has anything to do with is left out where BC is native: nothing is set for it, so the game keeps its own textures
+        self.settings = noBC ? settings : settings.filter { $0.no_bc != true }
         let env = ProcessInfo.processInfo.environment
         fromLaunch = Set((env["DM_ENV_LAUNCH_KEYS"] ?? "").split(separator: " ").map(String.init))
         fixed = fromLaunch.union((env["DM_ENV_FILE_KEYS"] ?? "").split(separator: " ").map(String.init))
