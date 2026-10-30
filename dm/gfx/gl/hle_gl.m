@@ -1252,6 +1252,16 @@ GL(glGetIntegerv, void, GLenum p, GLint *v) {
         case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: *v = NUNITS; return;
         case GL_MAX_VERTEX_UNIFORM_VECTORS: case GL_MAX_FRAGMENT_UNIFORM_VECTORS: *v = 1024; return;
         case GL_MAX_VARYING_VECTORS: *v = 31; return;
+        // GL 3.3 / 4.5 uniform-block and texture-buffer limits: Metal reports no equivalents, so the values are the host's
+        case 0x8A30: *v = 65536; return;   // GL_MAX_UNIFORM_BLOCK_SIZE
+        case 0x8C2B: *v = 65536; return;   // GL_MAX_TEXTURE_BUFFER_SIZE
+        case 0x8A2F: *v = 24; return;   // GL_MAX_UNIFORM_BUFFER_BINDINGS
+        case 0x8A2E: *v = 24; return;   // GL_MAX_COMBINED_UNIFORM_BLOCKS
+        case 0x8A2B: *v = 12; return;   // GL_MAX_VERTEX_UNIFORM_BLOCKS
+        case 0x8A2D: *v = 12; return;   // GL_MAX_FRAGMENT_UNIFORM_BLOCKS
+        case 0x8A31: case 0x8A32: case 0x8A33: *v = 4096; return;   // combined vertex / geometry / fragment uniform components
+        case 0x8B49: *v = 4096; return;   // GL_MAX_FRAGMENT_UNIFORM_COMPONENTS
+        case 0x8B4A: *v = 4096; return;   // GL_MAX_VERTEX_UNIFORM_COMPONENTS
         case GL_MAX_SAMPLES: *v = 8; return;
         case GL_SAMPLE_BUFFERS: case GL_SAMPLES: *v = 0; return;   // the window surface is not multisampled
         case GL_VIEWPORT: memcpy(v, S.vp, sizeof S.vp); return;

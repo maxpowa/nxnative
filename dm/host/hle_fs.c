@@ -1014,6 +1014,11 @@ HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → close
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
 HLE_FORCE("_ZN2nn2fs8MountRomEPKc", "fsp-srv; rom → host RomFS directory (overload without the cache arguments)", Result, h_fs_MountRom1, const char *name) { return h_fs_MountRom(name, NULL, 0); }
+// SDK 21 RomFS overloads: the host's SDK 16 hooks do not match these mangled names, so the native SDK mount path ran into fsp-srv
+HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPmi", "fsp-srv; rom reads the host directory directly, the cache gets only the minimum size (SDK 21 int overload)", Result, h_fs_QueryRomCacheInt, size_t *out, int flags) { (void)flags; *out = 0x1000; return RES_OK; }
+HLE_FORCE("_ZN2nn2fs8MountRomEPKciPvm", "fsp-srv; rom → host RomFS directory (SDK 21 int overload)", Result, h_fs_MountRomInt, const char *name, int flags, void *cache, size_t sz) { (void)flags; return h_fs_MountRom(name, cache, sz); }
+HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPmNS_13ApplicationIdE", "fsp-srv; rom reads the host directory directly (SDK 21 ApplicationId overload)", Result, h_fs_QueryRomCacheApp, size_t *out, uint64_t appid) { (void)appid; *out = 0x1000; return RES_OK; }
+HLE_FORCE("_ZN2nn2fs8MountRomEPKcNS_13ApplicationIdEPvm", "fsp-srv; rom → host RomFS directory (SDK 21 ApplicationId overload)", Result, h_fs_MountRomApp, const char *name, uint64_t appid, void *cache, size_t sz) { (void)appid; return h_fs_MountRom(name, cache, sz); }
 // ReadFile without the bytes-read output: the read must be complete; a short read (past the end of file) is returned as a failure
 HLE_FORCE("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", "fsp-srv → pread(2), must read in full", Result, h_fs_ReadFileExact, uint64_t h, int64_t off, void *buf, size_t sz) {
     size_t got = 0; Result r = h_fs_ReadFile(&got, h, off, buf, sz);
