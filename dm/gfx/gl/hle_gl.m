@@ -837,6 +837,7 @@ static int tex_make(tex_t *t, int rt) {
         if (vol || arr || fmt_int(t->fmt))
             GLOG("making texture %ux%ux%u %s, %d levels (%s, %s, usage %lu)%s", t->w, t->h, umax(1, t->d), m->name, lv,
                  vol ? "3D" : arr ? "array" : "2D", td.storageMode == MTLStorageModePrivate ? "private" : "shared", (unsigned long)td.usage, fmt_int(t->fmt) ? ", integer" : "");
+        if (t->w == 960 && t->h == 540) GLOG("making 960x540 texture: %s, %d levels, %s", m->name, lv, td.storageMode == MTLStorageModePrivate ? "private" : "shared");
         t->tex = [g_dev newTextureWithDescriptor:td];
         if (!t->tex) { GLOG("[RED] texture %ux%u %s (%d levels) could not be made", t->w, t->h, m->name, lv); t->made = 1; return 0; }
         if (vol || arr || fmt_int(t->fmt))
@@ -897,6 +898,10 @@ static void tex_image(GLenum target, GLint level, int f, int cv, uint32_t w, uin
 // ---------- Render passes ----------
 // The pass being encoded: framebuffer name, its attachments' generation (a changed attachment ends the pass), clears waiting for the pass to begin
 static struct { GLuint fb; uint64_t gen; int open; uint32_t w, h; MTLPixelFormat cpf[MAXCOL], dpf, spf; int ncol; } P;
+// The 960x540 textures that received draws: Factorio renders its save-preview capture into 75/76/79 and composites into the read target 74. Kept for the
+// read-back diagnostic (tex960_summary), which names the content of each at the moment the game reads the preview.
+#define HIST960 4
+static GLuint g_960_name[HIST960]; static __strong id<MTLTexture> g_960_tex[HIST960]; static int g_960_i, g_960_n;
 static struct { int bits; float c[4]; double d; int s; GLuint fb; } g_pend_clear;
 static struct { void *pso; void *dss; int cull, wind, vp[4], sc[4], sref; float pf, pu, dn, df; GLuint prog; uint64_t ub_gen[2]; } E;   // encoder state set so far (NULL / -1 = unset)
 
@@ -917,6 +922,12 @@ static void fb_size(GLuint fb, uint32_t *w, uint32_t *h) {
     for (int i = 0; i < MAXCOL && !a; i++) if (f->col[i].kind) a = &f->col[i];
     if (!a) a = f->depth.kind ? &f->depth : &f->stencil; uint64_t g = 0;
     id<MTLTexture> t = att_tex(a, &g); if (t) { *w = umax(1, (uint32_t)t.width >> a->level); *h = umax(1, (uint32_t)t.height >> a->level); }
+}
+// Whether a framebuffer has a 960x540 texture attached (Factorio's save-preview capture), without making any texture as fb_size does
+static int fb_is_960(GLuint fb) {
+    fb_t *f = fb_of(fb); if (!f) return 0;
+    for (int i = 0; i < MAXCOL; i++) if (f->col[i].kind == 1) { tex_t *t = tex_of(f->col[i].name); if (t && t->w == 960 && t->h == 540) return 1; }
+    return 0;
 }
 static void pass_end(void) {
     if (g_enc) { [g_enc endEncoding]; g_enc = nil; }
@@ -989,6 +1000,8 @@ static void pass_begin(void) {
         P.fb = S.fb; P.gen = gen; P.open = 1; g_n_pass++;
         if (ncol > 1) { static int n; if (n++ < 40) GLOG("MRT pass: framebuffer %u, %d draw buffers, formats %lu %lu %lu %lu", S.fb, ncol,
             (unsigned long)P.cpf[0], (unsigned long)P.cpf[1], (unsigned long)P.cpf[2], (unsigned long)P.cpf[3]); }
+        if (P.w == 960 && P.h == 540) { static int n; if (n++ < 20) GLOG("960x540 pass: framebuffer %u, %d attachments, formats %lu %lu, depth %lu", S.fb, ncol,
+            (unsigned long)P.cpf[0], (unsigned long)P.cpf[1], (unsigned long)P.dpf); }
         enc_reset();
     }
 }
@@ -1258,6 +1271,21 @@ static int draw_setup(void) {
     }
     bind_uniforms_textures(p);
     g_n_draw++;
+    if (P.w == 960 && P.h == 540) { fb_t *f = fb_of(S.fb); if (f) for (int i = 0; i < MAXCOL; i++) if (f->col[i].kind == 1) {
+        tex_t *tt = tex_of(f->col[i].name);
+        if (tt && tt->tex) {
+            GLuint nm = f->col[i].name;
+            int prev = (g_960_i + HIST960 - 1) % HIST960;
+            if (!g_960_n || g_960_name[prev] != nm) { g_960_name[g_960_i] = nm; g_960_tex[g_960_i] = tt->tex; g_960_i = (g_960_i + 1) % HIST960; if (g_960_n < HIST960) g_960_n++; }
+        } } }
+    if ((P.w == 960 && P.h == 540) || (P.w == 1920 && P.h == 1080)) { static int n; if (n++ < 400) GLOG("draw %dx%d: framebuffer %u program %u attachments %d masks %x %x viewport %d,%d %dx%d scissor %d,%d %dx%d vs %s fs %s", P.w, P.h, S.fb, S.prog, P.ncol, S.cmaski[0], S.cmaski[1],
+        S.vp[0], S.vp[1], S.vp[2], S.vp[3], S.sc[0], S.sc[1], S.sc[2], S.sc[3], p->si[0]->key, p->si[1]->key); }
+    // At 960x540, the samplers of the first draw into each target: the final composite's source texture is what the preview will show
+    if (P.w == 960 && P.h == 540) { static GLuint last_fb = ~0u; if (S.fb != last_fb) { last_fb = S.fb;
+        char line[400]; size_t o = 0; for (int i = 0; i < 8; i++) { tex_t *t = tex_of(S.units[i].t2d); if (!t || !t->tex) continue;
+            o += (size_t)snprintf(line + o, sizeof line - o, "%sunit %d: texture %u %ux%u fmt %lu", o ? ", " : "", i, S.units[i].t2d, (unsigned)t->tex.width, (unsigned)t->tex.height, (unsigned long)t->tex.pixelFormat);
+            if (o >= sizeof line - 60) break; }
+        GLOG("960 draw target %u samplers: %s", S.fb, line); } }
     // DM_GL_DRAWLOG=<n>[:<seconds>]: the first n draws after <seconds> of run time (default 0) with their target, viewport, scissor box and program
     // (a port's first question is where its draws go: a picture that stays black while the game keeps drawing is usually a target or a viewport, not a shader)
     { static long lim = -1, start_at; static double t0; static long n;
@@ -1367,6 +1395,8 @@ GLB(glClear, void, GLbitfield mask) {
     TLOG("clear bits %#x", mask);
     @autoreleasepool {
         uint32_t fw, fh; fb_size(S.fb, &fw, &fh);
+        if (fw == 960 && fh == 540) { static int n; if (n++ < 30) GLOG("960x540 clear: framebuffer %u bits %#x colour %.3f %.3f %.3f %.3f masks %x %x %x %x scissor %d", S.fb, mask,
+            S.clear_c[0], S.clear_c[1], S.clear_c[2], S.clear_c[3], S.cmaski[0], S.cmaski[1], S.cmaski[2], S.cmaski[3], S.scissor); }
         int full = !S.scissor || (S.sc[0] <= 0 && S.sc[1] <= 0 && S.sc[0] + S.sc[2] >= (int)fw && S.sc[1] + S.sc[3] >= (int)fh);
         int bits = mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         if (bits & GL_COLOR_BUFFER_BIT) for (int i = 0; i < MAXCOL; i++) if (S.cmaski[i] != 0 && S.cmaski[i] != 0xf) full = 0;
@@ -1421,7 +1451,10 @@ GLB(glClear, void, GLbitfield mask) {
         enc_reset();   // the next draw sets its own state again
     }
 }
-GL(glClearColor, void, GLfloat r, GLfloat g, GLfloat b, GLfloat a) { S.clear_c[0] = r; S.clear_c[1] = g; S.clear_c[2] = b; S.clear_c[3] = a; }
+GL(glClearColor, void, GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
+    { static int n; if (n++ < 30) GLOG("glClearColor %.3f %.3f %.3f %.3f", r, g, b, a); }
+    S.clear_c[0] = r; S.clear_c[1] = g; S.clear_c[2] = b; S.clear_c[3] = a;
+}
 GL(glClearDepth, void, GLdouble d) { S.clear_d = d < 0 ? 0 : d > 1 ? 1 : d; }
 GL(glClearDepthf, void, GLfloat d) { S.clear_d = d < 0 ? 0 : d > 1 ? 1 : d; }
 GL(glClearStencil, void, GLint s) { S.clear_s = s; }
@@ -1454,11 +1487,12 @@ static void cap_set(GLenum cap, int on) {
 GL(glEnable, void, GLenum cap) { cap_set(cap, 1); }
 GL(glDisable, void, GLenum cap) { cap_set(cap, 0); }
 GL(glColorMask, void, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+    { static int n; if (n++ < 60) GLOG("glColorMask %u %u %u %u", r, g, b, a); }
     uint8_t m = (r & 0xff ? 1 : 0) | (g & 0xff ? 2 : 0) | (b & 0xff ? 4 : 0) | (a & 0xff ? 8 : 0);
     S.cmask = m; for (int i = 0; i < MAXCOL; i++) S.cmaski[i] = m;
 }
 GL(glColorMaski, void, GLuint i, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
-    TLOG("color mask %u: %u %u %u %u", i, r, g, b, a);
+    { static int n; if (n++ < 60) GLOG("glColorMaski %u: %u %u %u %u", i, r, g, b, a); }
     if (i >= MAXCOL) { RED1("glColorMaski(%u) over %d draw buffers", i, MAXCOL); return; }
     S.cmaski[i] = (r & 0xff ? 1 : 0) | (g & 0xff ? 2 : 0) | (b & 0xff ? 4 : 0) | (a & 0xff ? 8 : 0);
 }
@@ -1531,8 +1565,17 @@ GL(glObjectLabel, void, GLenum id, GLuint name, GLsizei len, const GLchar *label
 static const char *const g_exts[] = {"GL_ARB_ES3_2_compatibility", "GL_ARB_ES3_compatibility",
     "GL_EXT_texture_filter_anisotropic", "GL_ARB_vertex_array_object", "GL_ARB_direct_state_access", "GL_ARB_half_float_vertex",
     "GL_ARB_framebuffer_object", "GL_ARB_texture_float", "GL_EXT_texture_sRGB", "GL_KHR_texture_compression_astc_ldr", "GL_NV_shadow_samplers_cube",
-    "GL_ARB_copy_image", "GL_NV_copy_image"};
+    "GL_ARB_copy_image", "GL_NV_copy_image",
+    "GL_EXT_texture_compression_s3tc", "GL_ARB_texture_compression_bptc", "GL_ARB_texture_compression_rgtc"};
 #define NEXTS (int)(sizeof g_exts / sizeof *g_exts)
+// BC formats are advertised only on devices that can sample them (A16 cannot: there the uploads are decoded to RGBA8/R8/RG8). The entries stay in the array so the
+// index mapping is stable; the queries below skip them when the device has no BC hardware.
+static int ext_on(int i) {
+    if (g_bc) return 1;
+    const char *n = g_exts[i];
+    return !strstr(n, "s3tc") && !strstr(n, "bptc") && !strstr(n, "rgtc");
+}
+static int n_ext_on(void) { int n = 0; for (int i = 0; i < NEXTS; i++) n += ext_on(i); return n; }
 // The API eglBindAPI chose: desktop OpenGL (0x30a2) or OpenGL ES (0x30a0). Both run on the same layer, as NVIDIA's driver serves the ES entry points from the desktop implementation;
 // only what the game reads back (the version strings, the EGL queries) says ES. 30XX binds ES first to look at the configurations (eglGetConfigs), then renders with a desktop 4.5 context
 static int g_egl_es;
@@ -1543,13 +1586,17 @@ GL(glGetString, const char *, GLenum n) {
         case GL_VERSION: return g_egl_es ? "OpenGL ES 3.2 NVIDIA 349.00" : "4.5.0 NVIDIA 349.00";
         case GL_SHADING_LANGUAGE_VERSION: return g_egl_es ? "OpenGL ES GLSL ES 3.20" : "4.50 NVIDIA";
         case GL_EXTENSIONS: {   // the compatibility profile's one string
-            static char all[1024]; if (!all[0]) for (int i = 0; i < NEXTS; i++) { strlcat(all, g_exts[i], sizeof all); strlcat(all, " ", sizeof all); }
+            static char all[1024]; if (!all[0]) for (int i = 0; i < NEXTS; i++) if (ext_on(i)) { strlcat(all, g_exts[i], sizeof all); strlcat(all, " ", sizeof all); }
             return all;
         }
     }
     RED1("glGetString(%#x) not implemented", n); return "";
 }
-GL(glGetStringi, const char *, GLenum n, GLuint i) { return n == GL_EXTENSIONS && i < (GLuint)NEXTS ? g_exts[i] : NULL; }
+GL(glGetStringi, const char *, GLenum n, GLuint i) {
+    if (n != GL_EXTENSIONS) return NULL;
+    for (int k = 0; k < NEXTS; k++) if (ext_on(k)) { if (!i) return g_exts[k]; i--; }
+    return NULL;
+}
 GL(glMaxShaderCompilerThreadsARB, void, GLuint n) { (void)n; }   // ARB_parallel_shader_compile: the host's shaders are built ahead, the hint changes nothing
 static void h_glGetIntegeri_v(GLenum p, GLuint i, GLint *v);
 GL(glGetInteger64v, void, GLenum p, int64_t *v) {
@@ -1559,7 +1606,7 @@ GL(glGetInteger64v, void, GLenum p, int64_t *v) {
 GL(glGetInteger64i_v, void, GLenum p, GLuint i, int64_t *v) { GLint iv = 0; h_glGetIntegeri_v(p, i, &iv); *v = iv; }
 GL(glGetIntegerv, void, GLenum p, GLint *v) {
     switch (p) {
-        case GL_NUM_EXTENSIONS: *v = NEXTS; return;
+        case GL_NUM_EXTENSIONS: *v = n_ext_on(); return;
         case GL_MAJOR_VERSION: *v = 4; return;
         case GL_MINOR_VERSION: *v = 5; return;
         case GL_CONTEXT_PROFILE_MASK: *v = 1; return;   // CONTEXT_CORE_PROFILE_BIT: what the games asked for (Digimon a 4.5 core context); LÖVE takes its core paths (the file header)
@@ -1806,6 +1853,8 @@ static void teximg_impl(const teximg_args *a0) {
         if (a->sub) {
             tex_t *t = bound_tex(a->target);
             int face = a->target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && a->target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(a->target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
+            if (t && t->w == 960 && t->h == 540) GLOG("960x540 sub upload: texture %u level %d %d,%d %dx%d format %#x type %#x pixels %p",
+                S.units[S.unit].t2d, a->level, a->x, a->y, a->w, a->h, a->format, a->type, a->pixels);
             if (!t || t->fmt < 0 || a->w <= 0 || a->h <= 0) return;
             int f = t->fmt, cv = CV_COPY;   // the data is converted to the texture's format
             if (f == F_RGBA8) cv = a->type == GL_UNSIGNED_SHORT_5_6_5 ? CV_565 : a->type == GL_UNSIGNED_SHORT_4_4_4_4 ? CV_4444 : a->type == GL_UNSIGNED_SHORT_5_5_5_1 ? CV_5551 :
@@ -1824,6 +1873,7 @@ static void teximg_impl(const teximg_args *a0) {
             return;
         }
         int cv, f = fmt_pick(a->ifmt, a->format, a->type, &cv);
+        if (a->w == 960 && a->h == 540) GLOG("960x540 texture upload: ifmt %#x format %#x type %#x pixels %p", a->ifmt, a->format, a->type, a->pixels);
         if (f < 0) { static GLint seen[16]; static int n; int k = 0; for (int i = 0; i < n; i++) k |= seen[i] == a->ifmt; if (!k && n < 16) { seen[n++] = a->ifmt; GLOG("[RED] texture internal format %#x (format %#x, type %#x) not mapped", a->ifmt, a->format, a->type); } return; }
         if (cv == CV_NONE && a->pixels) { RED1("texture data of format %#x type %#x into %s not converted (zeros)", a->format, a->type, g_fmt[f].name); }
         if (cv == CV_INDEX && !S.color_table) RED1("colour-index texture data with GL_COLOR_TABLE disabled");
@@ -1969,16 +2019,65 @@ GL(glGetTexLevelParameteriv, void, GLenum target, GLint level, GLenum pname, GLi
     }
     RED1("glGetTexLevelParameteriv(%#x) not implemented", pname); *v = 0;
 }
-// glGetTexImage: the game reads a texture back to CPU memory (Factorio's VideoBitmapOpenGL verifies generated bitmaps this way). RGBA8/BGRA8 textures are copied as
-// they are; compressed formats are left as zeros of the requested size (the generator already has the blocks in its staging texture, and A16 cannot filter-read BC).
+// glGetTexImage: the game reads a texture back to CPU memory (Factorio's VideoBitmapOpenGL verifies generated bitmaps this way, and its save preview is the
+// 960x540 capture it renders into 75/76/79 and composites into 74). RGBA8/BGRA8 textures are copied as they are; compressed formats are left as zeros of the
+// requested size (the generator already has the blocks in its staging texture, and A16 cannot filter-read BC).
+// A client-visible read (glGetTexImage, glGetCompressedTexImage) must see every command recorded so far: the game draws into its capture target and reads it back
+// without a swap in between. Those draws sit in the current command buffer, which is committed at the next present, while a readback blit would be a new command
+// buffer on the same queue and would run before them. Commit and wait for the frame's buffer first, as glFinish does.
+static void gl_read_sync(void) {
+    if (!g_cb) return;
+    if (g_pend_clear.bits) clears_flush();
+    dm_gfx_enter();
+    id<MTLCommandBuffer> cb = cb_get();
+    cb_commit();
+    [cb waitUntilCompleted];
+    dm_gfx_leave();
+}
+// Diagnostic: what a 960x540 texture really holds at the moment the game reads its preview back. A skipped clear, a silent copy and a wrong source all end as the
+// same magenta rectangle; three pixels plus a coarse distinct-colour count tell them apart.
+static void tex960_summary(const char *what, GLuint nm, id<MTLTexture> t) {
+    if (!t) { GLOG("960 %s texture %u: no Metal texture", what, nm); return; }
+    if (t.pixelFormat != MTLPixelFormatRGBA8Unorm) { GLOG("960 %s texture %u: format %lu", what, nm, (unsigned long)t.pixelFormat); return; }
+    uint32_t w = 960, h = 540; size_t pitch = (size_t)w * 4;
+    @autoreleasepool {
+        id<MTLBuffer> b = [g_dev newBufferWithLength:pitch * h options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [g_q commandBuffer]; cb.label = @"gl 960 summary";
+        id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+        [e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                   toBuffer:b destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch * h];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted]; g_n_blit++;
+        const uint8_t *p = b.contents;
+        uint32_t c0 = 0, c1 = 0, c2 = 0;
+        memcpy(&c0, p, 4); memcpy(&c1, p + (size_t)270 * pitch + 480 * 4, 4); memcpy(&c2, p + (size_t)539 * pitch + 959 * 4, 4);
+        uint32_t seen[8]; int ns = 0, total = 0;
+        for (uint32_t y = 0; y < h; y += 18) for (uint32_t x = 0; x < w; x += 16) {
+            uint32_t v; memcpy(&v, p + (size_t)y * pitch + (size_t)x * 4, 4); total++;
+            int i; for (i = 0; i < ns; i++) if (seen[i] == v) break;
+            if (i == ns && ns < 8) seen[ns++] = v;
+        }
+        GLOG("960 %s texture %u: (0,0) %08x (480,270) %08x (959,539) %08x; %d distinct colour%s in %d samples", what, nm, c0, c1, c2, ns, ns == 8 ? "s (8+)" : "", total);
+    }
+}
 GL(glGetTexImage, void, GLenum target, GLint level, GLenum format, GLenum type, void *pixels) {    (void)type;
     tex_t *t = bound_tex(target);
+    GLOG("glGetTexImage target %#x level %d format %#x type %#x texture %u %s %ux%u", target, level, format, type, S.units[S.unit].t2d,
+         t ? g_fmt[t->fmt].name : "none", t ? t->w : 0, t ? t->h : 0);
     if (!t || level < 0 || level >= MAXLV) return;
+    gl_read_sync();                          // the draws into the target must have run before any read of it
+    pass_end();                              // a blit encoder cannot be made while this pass is open
     int face = target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
     uint32_t w = umax(1, t->w >> level), h = umax(1, t->h >> level);
     int comps = format == GL_RGBA || format == GL_BGRA ? 4 : format == GL_RGB ? 3 : format == GL_RED ? 1 : 4;
     size_t pitch = (size_t)w * comps;
     if (!pixels) return;
+    if (w == 960 && h == 540 && comps == 4) {
+        if (!t->made) tex_make(t, 0);
+        GLuint bound = S.units[S.unit].t2d;
+        tex960_summary("read target", bound, t->tex);
+        for (int k = 0; k < g_960_n; k++) { int idx = (g_960_i + HIST960 - 1 - k) % HIST960;
+            if (g_960_tex[idx] && g_960_name[idx] != bound) tex960_summary("draw target", g_960_name[idx], g_960_tex[idx]); }
+    }
     memset(pixels, 0, pitch * h);
     if (pixels && comps == 4 && (format == GL_RGBA || format == GL_BGRA) && g_fmt[t->fmt].pf == MTLPixelFormatRGBA8Unorm) {
         if (!t->made && !tex_make(t, 0)) return;
@@ -1998,6 +2097,10 @@ GL(glGetTexImage, void, GLenum target, GLint level, GLenum format, GLenum type, 
             if (format == GL_BGRA) { uint8_t *p = pixels; for (size_t i = 0; i < pitch * h; i += 4) { uint8_t r = p[i]; p[i] = p[i + 2]; p[i + 2] = r; } }
         }
     }
+    if (w == 960 && h == 540) {
+        uint32_t px = 0; memcpy(&px, pixels, 4);
+        GLOG("preview read: first pixel %08x", px);
+    }
 }
 
 // glGetCompressedTexImage: a texture decoded from BC has no compressed bytes to return; the game's compression self-test asks for this buffer and compares
@@ -2005,11 +2108,26 @@ GL(glGetTexImage, void, GLenum target, GLint level, GLenum format, GLenum type, 
 GL(glGetCompressedTexImage, void, GLenum target, GLint level, void *pixels) {
     tex_t *t = bound_tex(target);
     if (!t || !pixels || level < 0 || level >= MAXLV) return;
+    gl_read_sync();
     uint32_t w = umax(1, t->w >> level), h = umax(1, t->h >> level);
-    size_t n = t->bc ? bc_src_size(t->bc, w, h) : fmt_pitch(t->fmt, w) * fmt_rows(t->fmt, h);
+    size_t pitch = t->bc ? (size_t)((w + 3) / 4) * bc_block_bytes(t->bc) : fmt_pitch(t->fmt, w);
+    size_t rows = t->bc ? (h + 3) / 4 : fmt_rows(t->fmt, h);
+    size_t n = pitch * rows;
     memset(pixels, 0, n);
-    if (t->bc && t->tex && t->tex.storageMode == MTLStorageModeShared && g_bc)
-        [t->tex getBytes:pixels bytesPerRow:n / umax(1, fmt_rows(t->fmt, h)) bytesPerImage:0 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:0];
+    if (!t->made || !t->tex || !g_bc || t->bc || g_fmt[t->fmt].kind != K_BLOCK) return;   // a decoded texture has no block bytes to return
+    @autoreleasepool {
+        if (t->tex.storageMode == MTLStorageModeShared) {
+            [t->tex getBytes:pixels bytesPerRow:pitch bytesPerImage:pitch * rows fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:0];
+        } else {
+            id<MTLBuffer> b = [g_dev newBufferWithLength:n options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> cb = [g_q commandBuffer]; cb.label = @"gl read compressed texture";
+            id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+            [e copyFromTexture:t->tex sourceSlice:0 sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                       toBuffer:b destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch * rows];
+            [e endEncoding]; [cb commit]; [cb waitUntilCompleted]; g_n_blit++;
+            memcpy(pixels, b.contents, n);
+        }
+    }
 }
 
 // ---------- Framebuffers and renderbuffers ----------
@@ -2021,7 +2139,8 @@ GLB(glBindFramebuffer, void, GLenum target, GLuint f) {
     TLOG("bind framebuffer %#x %u", target, f);
     if (target != GL_DRAW_FRAMEBUFFER) S.read_fb = f;   // GL_FRAMEBUFFER binds both
     if (target == GL_READ_FRAMEBUFFER || f == S.fb) return;
-    { static int on = -1; if (on < 0) on = getenv("DM_GL_FBLOG") != NULL; if (on) { uint32_t bw, bh; fb_size(f, &bw, &bh); GLOG("bind framebuffer %u %ux%u (was %u) after %llu draws", f, bw, bh, S.fb, (unsigned long long)g_n_draw); } }
+    { static int on = -1; if (on < 0) on = getenv("DM_GL_FBLOG") != NULL;
+      if (on || fb_is_960(f)) { static int n; if (on || n++ < 120) GLOG("bind framebuffer %u (was %u) after %llu draws%s", f, S.fb, (unsigned long long)g_n_draw, fb_is_960(f) ? " (960x540)" : ""); } }
     if (g_pend_clear.bits && g_pend_clear.fb == S.fb) clears_flush();
     S.fb = f;   // the pass ends at the next draw or clear into another framebuffer (pass_ensure)
 }
@@ -2109,6 +2228,7 @@ static void fb_attach(GLenum target, GLenum attachment, int kind, GLuint name, i
     else { RED1("framebuffer attachment %#x not implemented", attachment); return; }
     TLOG("attach framebuffer %u attachment %#x %s %u level %d layer %d", target == GL_READ_FRAMEBUFFER ? S.read_fb : S.fb, attachment,
          kind == 2 ? "renderbuffer" : "texture", name, level, face);
+    { tex_t *at = kind == 1 ? tex_of(name) : NULL; if (at && at->w == 960 && at->h == 540) GLOG("960x540 attachment: framebuffer %u attachment %#x texture %u level %d", S.fb, attachment, name, level); }
     f->gen++;
 }
 GL(glFramebufferTexture2D, void, GLenum target, GLenum att, GLenum textarget, GLuint t, GLint level) {
@@ -2137,6 +2257,10 @@ static void blit_impl(const blit_args *a) __attribute__((used));
 BIGSTUB(blit_impl);
 static void blit_impl(const blit_args *a) {
     @autoreleasepool {
+        uint32_t sw = 0, sh = 0, dw = 0, dh = 0; fb_size(S.read_fb, &sw, &sh); fb_size(S.fb, &dw, &dh);
+        int big = (sw == 960 && sh == 540) || (dw == 960 && dh == 540);
+        if ((a->mask & GL_COLOR_BUFFER_BIT) || big) { static int n; if (big || n++ < 30) GLOG("glBlitFramebuffer src %d,%d..%d,%d -> dst %d,%d..%d,%d mask %#llx read fb %u (%ux%u) draw fb %u (%ux%u)%s",
+            a->s[0], a->s[1], a->s[2], a->s[3], a->d[0], a->d[1], a->d[2], a->d[3], (unsigned long long)a->mask, S.read_fb, sw, sh, S.fb, dw, dh, big ? " (960x540)" : ""); }
         if (a->mask & ~GL_COLOR_BUFFER_BIT) RED1("glBlitFramebuffer of depth or stencil not implemented");
         if (!(a->mask & GL_COLOR_BUFFER_BIT)) return;
         if (g_pend_clear.bits) clears_flush();
@@ -2156,6 +2280,7 @@ static void blit_impl(const blit_args *a) {
 // frames (15 calls right after level.dat loads); without it those frames stay black. Metal copies only between matching pixel formats, so a format change is
 // reported rather than silently producing garbage.
 static void copy_tex_from_fb(GLenum target, GLint level, GLint xoff, GLint yoff, GLint zoff, GLint x, GLint y, GLsizei w, GLsizei h) {
+    GLOG("copy tex sub image target %#x level %d -> %d,%d,%d from %d,%d %dx%d (read fb %u)", target, level, xoff, yoff, zoff, x, y, w, h, S.read_fb);
     tex_t *d = bound_tex(target);
     if (!d || w <= 0 || h <= 0) { RED1("glCopyTexSubImage: no destination texture (%dx%d)", w, h); return; }
     if (!d->made && !tex_make(d, 0)) return;
@@ -2189,8 +2314,10 @@ typedef struct { GLuint srcName; GLenum srcTarget; GLint srcLevel, srcX, srcY, s
 // noinline: the TLOG call inside must not run in the 15-argument wrapper's frame, where it can overwrite the incoming stack arguments before they are copied
 static void copy_image_sub_data(const char *what, const copyimg_t *a) __attribute__((noinline));
 static void copy_image_sub_data(const char *what, const copyimg_t *a) {
-    TLOG("%s %u/%#x level %d (%d,%d,%d) -> %u/%#x level %d (%d,%d,%d) %dx%dx%d", what, a->srcName, a->srcTarget, a->srcLevel, a->srcX, a->srcY, a->srcZ,
-         a->dstName, a->dstTarget, a->dstLevel, a->dstX, a->dstY, a->dstZ, a->w, a->h, a->d);
+    tex_t *s0 = tex_of(a->srcName), *d0 = tex_of(a->dstName);
+    int big = (s0 && s0->w == 960 && s0->h == 540) || (d0 && d0->w == 960 && d0->h == 540);
+    { static int n; if (big || n++ < 40) GLOG("%s %u/%#x level %d (%d,%d,%d) -> %u/%#x level %d (%d,%d,%d) %dx%dx%d%s", what, a->srcName, a->srcTarget, a->srcLevel, a->srcX, a->srcY, a->srcZ,
+         a->dstName, a->dstTarget, a->dstLevel, a->dstX, a->dstY, a->dstZ, a->w, a->h, a->d, big ? " (960x540)" : ""); }
     tex_t *s = tex_of(a->srcName), *dt = tex_of(a->dstName);
     if (!s || !dt || a->w <= 0 || a->h <= 0 || a->d <= 0) { RED1("%s: no source or destination texture (%ux%ux%u)", what, a->w, a->h, a->d); return; }
     if (!s->made && !tex_make(s, 0)) return;
@@ -2275,6 +2402,7 @@ static void readpix_impl(const readpix_args *a) {
     }
 }
 GL(glReadPixels, void, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void *data) {
+    GLOG("glReadPixels %d,%d %dx%d format %#x type %#x read framebuffer %u", x, y, w, h, format, type, S.read_fb);
     readpix_args a = {x, y, w, h, format, type, data}; ((void (*)(const readpix_args *))(const void *)readpix_impl_bs)(&a);
 }
 

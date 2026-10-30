@@ -12,6 +12,7 @@ Brought up on an iPhone 15 (A16, 6 GB). The main menu, a new world, the intro cu
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | main's own pool (the log reports a ~3.1 GB guest heap) |
 | `shader_groups /data/=data` | `game.tsv` | the GLSL sources under `rom:/data/core/graphics/shaders` |
 | `zip_store .dat:.ogg:.png:.ttf:.zip:.metallib` | `game.tsv` | RomFS files kept stored in the IPA |
+| `op_mode handheld` | `game.tsv` | Factorio's free cursor is moved by the right stick and jumped by tapping; touch is only fed in handheld mode. The launcher's Console mode overrides it |
 | `romfs_marker data/core/fonts/NotoSansCJKsc-Bold.ttf` | `game.tsv` | the RomFS survey marker |
 
 No `patches.py`: the game's own builds are untouched. Everything found so far is a host-layer fix, and the profile-specific parts are gated on the build ID in the host.
