@@ -149,9 +149,6 @@ static id<MTLRenderCommandEncoder> g_enc;
 static _Atomic uint64_t g_n_draw, g_n_pass, g_n_up, g_n_blit, g_n_pso, g_n_cb;
 static _Atomic uint64_t g_sk_prog, g_sk_pass, g_sk_attr, g_sk_pso;   // draws dropped in draw_setup, by reason
 static uint64_t g_frames;
-static uint8_t g_drawn_tex[1 << 16];            // textures that have been a colour attachment of a draw (DM_GL_WATER_LOG)
-static uint32_t g_drawn_frame[1 << 16];         // the frame of that draw, so a per-frame read can tell a stale target
-static GLuint g_water_mask, g_water_noise; static uint32_t g_water_frames;
 
 // ---------- Shader table (<DM_MSL_DIR>/gl/gl_shaders.tsv) ----------
 enum { T_FLOAT, T_VEC2, T_VEC3, T_VEC4, T_INT, T_IVEC2, T_IVEC3, T_IVEC4, T_UINT, T_UVEC2, T_UVEC3, T_UVEC4, T_BOOL, T_MAT2, T_MAT3, T_MAT4,
@@ -646,7 +643,7 @@ static void *pixels_convert(const void *src, uint32_t w, uint32_t h, GLenum form
                 if (dbytes == sbytes) memcpy(d, s, (size_t)w * dbytes);
                 else if (dbytes < sbytes) for (uint32_t x = 0; x < w; x++) memcpy(d + (size_t)x * dbytes, s + (size_t)x * sbytes, (size_t)dbytes);
                 else for (uint32_t x = 0; x < w; x++) { uint8_t *q = d + (size_t)x * dbytes; memset(q, 0, (size_t)dbytes);
-                        for (int c = 0; c < sbytes; c++) q[c] = s[(size_t)x * sbytes + c]; q[3] = 255; }
+                        for (int c = 0; c < sbytes; c++) q[c] = s[(size_t)x * sbytes + c]; if (dbytes == 4) q[3] = 255; }
                 break;
             case CV_SWAP_RB: for (uint32_t x = 0; x < w; x++) { d[4 * x] = s[4 * x + 2]; d[4 * x + 1] = s[4 * x + 1]; d[4 * x + 2] = s[4 * x]; d[4 * x + 3] = s[4 * x + 3]; } break;
             case CV_RGB8: for (uint32_t x = 0; x < w; x++) { d[4 * x] = s[3 * x]; d[4 * x + 1] = s[3 * x + 1]; d[4 * x + 2] = s[3 * x + 2]; d[4 * x + 3] = 255; } break;
@@ -903,7 +900,6 @@ static int tex_make(tex_t *t, int rt) {
         if (vol || arr || fmt_int(t->fmt))
             GLOG("making texture %ux%ux%u %s, %d levels (%s, %s, usage %lu)%s", t->w, t->h, umax(1, t->d), m->name, lv,
                  vol ? "3D" : arr ? "array" : "2D", td.storageMode == MTLStorageModePrivate ? "private" : "shared", (unsigned long)td.usage, fmt_int(t->fmt) ? ", integer" : "");
-        if (t->w == 960 && t->h == 540) GLOG("making 960x540 texture: %s, %d levels, %s", m->name, lv, td.storageMode == MTLStorageModePrivate ? "private" : "shared");
         t->tex = [g_dev newTextureWithDescriptor:td];
         if (!t->tex) { GLOG("[RED] texture %ux%u %s (%d levels) could not be made", t->w, t->h, m->name, lv); t->made = 1; return 0; }
         if (vol || arr || fmt_int(t->fmt))
@@ -1056,8 +1052,6 @@ static void pass_begin(void) {
         P.fb = S.fb; P.gen = gen; P.open = 1; g_n_pass++;
         if (ncol > 1) { static int n; if (n++ < 40) GLOG("MRT pass: framebuffer %u, %d draw buffers, formats %lu %lu %lu %lu", S.fb, ncol,
             (unsigned long)P.cpf[0], (unsigned long)P.cpf[1], (unsigned long)P.cpf[2], (unsigned long)P.cpf[3]); }
-        if (P.w == 960 && P.h == 540) { static int n; if (n++ < 20) GLOG("960x540 pass: framebuffer %u, %d attachments, formats %lu %lu, depth %lu", S.fb, ncol,
-            (unsigned long)P.cpf[0], (unsigned long)P.cpf[1], (unsigned long)P.dpf); }
         enc_reset();
     }
 }
@@ -1342,29 +1336,6 @@ static int draw_setup(void) {
     }
     bind_uniforms_textures(p);
     g_n_draw++;
-    { fb_t *f = fb_of(S.fb); if (f) for (int i = 0; i < MAXCOL; i++) if (f->col[i].kind == 1) { g_drawn_tex[f->col[i].name & 0xffff] = 1; g_drawn_frame[f->col[i].name & 0xffff] = (uint32_t)g_frames; } }
-    // DM_GL_WATER_LOG=1: the water effect's inputs. tiles-water-effect.frag reads mask = texelFetch(waterMaskTexture, ivec2(gl_FragCoord.xy)), so that texture must be a
-    // screen-sized target an earlier pass drew into; an unrendered one reads undefined memory, a fine noise over the whole water surface.
-    { static int on = -1; if (on < 0) on = getenv("DM_GL_WATER_LOG") != NULL;
-      if (on && !strcmp(p->si[1]->key, "c8be8473ef053a2d")) { static int n; if (n++ % 60 == 0) {
-        char line[700]; size_t o = 0; fb_t *f = fb_of(S.fb);
-        if (f) for (int i = 0; i < MAXCOL; i++) if (f->col[i].kind == 1) o += (size_t)snprintf(line + o, sizeof line - o, "%satt %d: tex %u", o ? ", " : "", i, f->col[i].name);
-        GLOG("water draw %d: fb %u %ux%u, %s", n, S.fb, P.w, P.h, line);
-        o = 0;
-        for (int i = 0; i < p->nu; i++) { const puni_t *u = &p->u[i]; if (!is_samp(u->type)) continue;
-            int unit = u->unit < 0 || u->unit >= NUNITS ? 0 : u->unit;
-            GLenum target = u->type == T_SAMPCUBE ? GL_TEXTURE_CUBE_MAP : u->type == T_SAMP3D ? GL_TEXTURE_3D : u->type == T_SAMP2DARR ? GL_TEXTURE_2D_ARRAY
-                          : is_buf_samp(u->type) ? GL_TEXTURE_BUFFER : GL_TEXTURE_2D;
-            GLuint tn = *unit_slot(unit, target); tex_t *t = tex_of(tn);
-            samp_t *so = samp_of(S.sampler[unit]);
-            o += (size_t)snprintf(line + o, sizeof line - o, "%s%s(u%d) tex %u", o ? ", " : "", u->name, unit, tn);
-            if (t) { o += (size_t)snprintf(line + o, sizeof line - o, " %ux%u %s lv%d min %#x mag %#x wrap %#x/%#x%s, drawn in frame %u",
-                        t->w, t->h, g_fmt[t->fmt].name, t->levels, so ? so->minf : t->minf, so ? so->magf : t->magf,
-                        so ? so->ws : t->ws, so ? so->wt : t->wt, so ? " (object)" : "", g_drawn_frame[tn & 0xffff]);
-                     if (!strcmp(u->name, "waterMaskTexture")) { g_water_mask = tn; g_water_frames = g_drawn_frame[tn & 0xffff]; }
-                     if (!strcmp(u->name, "waterNoiseTexture")) g_water_noise = tn; } }
-        GLOG("water samplers: %s", line); } } }
-    if ((P.w == 960 && P.h == 540) || (P.w == 1920 && P.h == 1080)) { static int n; if (n++ < 60) GLOG("draw %dx%d: framebuffer %u program %u attachments %d", P.w, P.h, S.fb, S.prog, P.ncol); }
     // DM_GL_DRAWLOG=<n>[:<seconds>]: the first n draws after <seconds> of run time (default 0) with their target, viewport, scissor box and program
     // (a port's first question is where its draws go: a picture that stays black while the game keeps drawing is usually a target or a viewport, not a shader)
     { static long lim = -1, start_at; static double t0; static long n;
@@ -1474,8 +1445,6 @@ GLB(glClear, void, GLbitfield mask) {
     TLOG("clear bits %#x", mask);
     @autoreleasepool {
         uint32_t fw, fh; fb_size(S.fb, &fw, &fh);
-        if (fw == 960 && fh == 540) { static int n; if (n++ < 30) GLOG("960x540 clear: framebuffer %u bits %#x colour %.3f %.3f %.3f %.3f", S.fb, mask,
-            S.clear_c[0], S.clear_c[1], S.clear_c[2], S.clear_c[3]); }
         int full = !S.scissor || (S.sc[0] <= 0 && S.sc[1] <= 0 && S.sc[0] + S.sc[2] >= (int)fw && S.sc[1] + S.sc[3] >= (int)fh);
         int bits = mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         if (bits & GL_COLOR_BUFFER_BIT) for (int i = 0; i < MAXCOL; i++) if (S.cmaski[i] != 0 && S.cmaski[i] != 0xf) full = 0;
@@ -1942,10 +1911,6 @@ static void teximg_impl(const teximg_args *a) __attribute__((used));
 BIGSTUB(teximg_impl);
 static void teximg_impl(const teximg_args *a0) {
     teximg_args a1 = *a0; a1.pixels = unpack_src(a0->pixels); const teximg_args *a = &a1;
-    // DM_GL_WATER_LOG=1: the uploads at the water noise texture's size (512x512), to see which format the game picks with and without BC
-    { static int on = -1; if (on < 0) on = getenv("DM_GL_WATER_LOG") != NULL;
-      static int n; if (on && n < 10 && a->w == 512 && a->h == 512) { n++;
-        GLOG("512x512 upload: %s%s level %d ifmt %#x format %#x type %#x size %d pixels %p", a->sub ? "sub" : "image", a->compressed ? " compressed" : "", a->level, a->ifmt, a->format, a->type, a->size, a->pixels); } }
     @autoreleasepool {
         if (a->sub) {
             tex_t *t = bound_tex(a->target);
@@ -1976,7 +1941,6 @@ static void teximg_impl(const teximg_args *a0) {
             return;
         }
         int cv, f = fmt_pick(a->ifmt, a->format, a->type, &cv);
-        if (a->w == 960 && a->h == 540) GLOG("960x540 texture upload: ifmt %#x format %#x type %#x pixels %p", a->ifmt, a->format, a->type, a->pixels);
         if (f < 0) { static GLint seen[16]; static int n; int k = 0; for (int i = 0; i < n; i++) k |= seen[i] == a->ifmt; if (!k && n < 16) { seen[n++] = a->ifmt; GLOG("[RED] texture internal format %#x (format %#x, type %#x) not mapped", a->ifmt, a->format, a->type); } return; }
         if (cv == CV_NONE && a->pixels) { RED1("texture data of format %#x type %#x into %s not converted (zeros)", a->format, a->type, g_fmt[f].name); }
         if (cv == CV_INDEX && !S.color_table) RED1("colour-index texture data with GL_COLOR_TABLE disabled");
@@ -2295,7 +2259,6 @@ static void fb_attach(GLenum target, GLenum attachment, int kind, GLuint name, i
     else { RED1("framebuffer attachment %#x not implemented", attachment); return; }
     TLOG("attach framebuffer %u attachment %#x %s %u level %d layer %d", target == GL_READ_FRAMEBUFFER ? S.read_fb : S.fb, attachment,
          kind == 2 ? "renderbuffer" : "texture", name, level, face);
-    { tex_t *at = kind == 1 ? tex_of(name) : NULL; if (at && at->w == 960 && at->h == 540) GLOG("960x540 attachment: framebuffer %u attachment %#x texture %u level %d", S.fb, attachment, name, level); }
     f->gen++;
 }
 GL(glFramebufferTexture2D, void, GLenum target, GLenum att, GLenum textarget, GLuint t, GLint level) {
@@ -2762,35 +2725,8 @@ GL(glGetUniformuiv, void, GLuint pr, GLint loc, GLuint *v) { uni_read(pr, loc, v
 // ---------- EGL ----------
 #define EGL_TRUE 1
 static struct { int init; int surface; uint32_t w, h; } g_egl;
-static uint64_t g_frames;
 // Every 300 frames: draws, passes, uploads; every 1800: memory (the process footprint, Metal's allocations, the GL objects alive), as the NVN layer's memory report
-// DM_GL_WATER_LOG=1: the centre 16x16 of a texture the water shader samples, channel 0. Smooth coverage means the pass ran; a spread of values in a tiny patch means
-// the shader is reading something it never should (an unrendered surface, or a texture with no mip chain sampled while minified).
-static void dump_tex16(const char *what, GLuint name, uint32_t drawn) {
-    tex_t *t = tex_of(name);
-    if (!t || !t->tex || (t->tex.pixelFormat != MTLPixelFormatR8Unorm && t->tex.pixelFormat != MTLPixelFormatRGBA8Unorm)) return;
-    @autoreleasepool {
-        id<MTLTexture> tx = t->tex; NSUInteger w = umin(16u, tx.width), h = umin(16u, tx.height);
-        id<MTLBuffer> b = [g_dev newBufferWithLength:64 * h options:MTLResourceStorageModeShared];
-        id<MTLCommandBuffer> cb = [g_q commandBuffer]; cb.label = @"gl water dump";
-        id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
-        [e copyFromTexture:tx sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(tx.width / 2 - w / 2, tx.height / 2 - h / 2, 0)
-                sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:0 destinationBytesPerRow:64 destinationBytesPerImage:64 * h];
-        [e endEncoding]; [cb commit]; [cb waitUntilCompleted]; g_n_blit++;
-        const uint8_t *p = b.contents; int step = tx.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4;
-        int mn = 255, mx = 0, nd = 0; uint8_t seen[16];
-        for (NSUInteger i = 0; i < w * h; i++) { uint8_t v = p[i * step]; if (v < mn) mn = v; if (v > mx) mx = v;
-            int k; for (k = 0; k < nd; k++) if (seen[k] == v) break; if (k == nd && nd < 16) seen[nd++] = v; }
-        GLOG("%s %u: %ux%u %s, drawn in frame %u (now %llu), centre %ux%u channel 0 min %d max %d, %d distinct value%s", what, name,
-             (unsigned)tx.width, (unsigned)tx.height, tx.pixelFormat == MTLPixelFormatR8Unorm ? "R8" : "RGBA8", drawn,
-             (unsigned long long)g_frames, (unsigned)w, (unsigned)h, mn, mx, nd, nd == 1 ? "" : "s");
-    }
-}
 static void frame_end(void) {
-    // DM_GL_WATER_LOG=1: a few texels of the screen-sized texture the water shader reads per pixel (waterMaskTexture), once every 60 frames. Smooth coverage means the
-    // mask pass ran; noise means the shader reads a surface that was never rendered, or one rendered at another size.
-    { static int on = -1; if (on < 0) on = getenv("DM_GL_WATER_LOG") != NULL;
-      if (on && g_frames % 60 == 0) { dump_tex16("water mask", g_water_mask, g_water_frames); dump_tex16("water noise", g_water_noise, 0); } }
     static uint64_t pd, pp, pu, pb, pc;
     uint64_t f = ++g_frames, dr = g_n_draw, pa = g_n_pass, up = g_n_up, bl = g_n_blit, cb = g_n_cb;
     uint64_t sp = g_sk_prog, sq = g_sk_pass, sa = g_sk_attr, so = g_sk_pso;
