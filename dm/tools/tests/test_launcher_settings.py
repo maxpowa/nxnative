@@ -15,7 +15,7 @@ settings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(settings)
 
 BOTW, WONDER = '01007EF00011E000', '010015100B514000'
-PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
+PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_TEX_QUALITY', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
 
 
 def build(gid, api, platform=None):
@@ -168,7 +168,7 @@ def conforms(value, node, root, at='$'):
     if / then), as a list of problems: enough to hold the written lists to the contract without a jsonschema package"""
     if '$ref' in node: return conforms(value, root['$defs'][node['$ref'].rsplit('/', 1)[1]], root, at)
     problems = []
-    kinds = {'object': dict, 'array': list, 'string': str, 'integer': int, 'number': (int, float)}
+    kinds = {'object': dict, 'array': list, 'string': str, 'integer': int, 'number': (int, float), 'boolean': bool}
     if 'type' in node and not isinstance(value, kinds[node['type']]): return [f'{at}: not a {node["type"]}']
     if 'const' in node and value != node['const']: problems.append(f'{at}: not {node["const"]!r}')
     if 'enum' in node and value not in node['enum']: problems.append(f'{at}: not one of {node["enum"]}')

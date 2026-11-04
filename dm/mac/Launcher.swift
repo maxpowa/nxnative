@@ -5,6 +5,7 @@
 // app without the game. "Show this window at launch" off: no window unless Option is held at launch, and launcher.c applies the saved choices. The window never takes focus by itself: an app
 // opened in the background (open -g) keeps its window behind until the player switches to it
 import AppKit
+import Metal
 import QuartzCore
 import SwiftUI
 
@@ -187,7 +188,12 @@ public func dmMacLauncher() -> Int32 {
         fputs("launcher: settings window off (hold Option at launch to show it)\n", stderr)
         return 2
     }
-    let model = LauncherModel(file.settings)
+    let bc: Bool = {
+        guard let d = MTLCreateSystemDefaultDevice() else { return true }
+        if #available(macOS 13.0, *) { return d.supportsBCTextureCompression }
+        return false
+    }()
+    let model = LauncherModel(file.settings, noBC: !bc)
     let app = NSApplication.shared, launcher = Launcher(model)
     app.setActivationPolicy(.regular)
     app.delegate = launcher
