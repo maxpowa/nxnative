@@ -15,9 +15,10 @@ import game   # noqa: E402
 OUT = REPO / 'docs' / 'agents' / 'game-patches.md'
 SDK = REPO / 'dm/tools/sdk_patches.py'
 HOST = ['dm/host', 'dm/gfx', 'dm/ios']   # tracked files only: dm/host/gen and other build output are git-ignored
-HOST_EXT = ('.c', '.m', '.mm', '.h', '.swift')
+HOST_EXT = ('.c', '.m', '.mm', '.h', '.inc', '.swift')
 # What a build-keyed host table does (the table's name in the source; a row of another table is listed under its own name)
-TABLES = {'k_locks': 'engine frame limit set to fps_target', 'k_ue': "Unreal's allocator on a host malloc zone", 'k_nier_dr': 'frame interval and dynamic-resolution floor'}
+TABLES = {'k_locks': 'engine frame limit set to fps_target', 'k_ue': "Unreal's allocator on a host malloc zone", 'k_nier_dr': 'frame interval and dynamic-resolution floor',
+          'k_copy_image': 'copy-image dispatch slot written at a fixed offset'}
 # Profile keys that are not behaviour switches: per-game data or controls, not something the host does differently
 NOT_SWITCHES = {'pad_layout', 'depth_mode', 'mem_used', 'sys_resource'}
 
@@ -80,6 +81,9 @@ HOST_BINDING = [
      'why': "engine code other Frostbite games ship (the simulation's own rate is already set by name)", 'blocked': 'one Frostbite game here'}),
     ('k_ue', '', 'feae83dc9e9fb34c77d0a62f1fa9ae9f', {'what': "UE3's GMalloc setup skipped, the host allocator in (hle_uemalloc.c)", 'now': 'build', 'goal': 'game', 'purpose': 'address space',
      'why': "UE3 inlines the allocator's constructor into the GMalloc setup and has its own vtable layout (25 slots, 32-bit sizes), so the Unreal 4/5 discovery does not apply"}),
+    ('k_copy_image', '', '30bf431ee5105f84382808faf85eb420', {'what': "Factorio's copy-image dispatch slot at main+0x2e37260", 'now': 'build', 'goal': 'host', 'purpose': 'rendering',
+     'why': 'the game fills the slot from a weak glCopyImageSubData import that its loader never asks eglGetProcAddress for, so the 3D bitmap assembly calls address 0; the host '
+            'writes its own function there. The offset is this build\'s: writing it in another game would corrupt its data'}),
     ('k_nier_dr', '', '', {'what': "NieR's frame interval and dynamic-resolution floor at fixed addresses", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
      'checked': "both releases' mains, where these rows were found",
      'why': "the game's own display object; the Asian release's function is the global one's 0x13c0 further on, so the rewriter's function match could give the host both releases' addresses"}),
@@ -121,11 +125,20 @@ SWITCH_BINDING = [
     ('shader_key_skip', '', {'what': 'control-section bytes left out of shader keys', 'now': 'game', 'goal': 'game', 'purpose': 'shaders',
      'why': "the engine shares one control section among shaders; leaving GLSLC's compile information out of every game's keys would change every shader key"}),
     ('ue_texture_pool', '', {'what': "Unreal's texture streaming pool", 'now': 'game', 'goal': 'game', 'purpose': 'memory', 'why': "the game's own budget, raised to its Windows value"}),
+    ('snowdrop_pools', '', {'what': "Snowdrop's three page pools' address ranges", 'now': 'game', 'goal': 'game', 'purpose': 'address space',
+     'why': "the rewriter finds the allocator in any build (snowdrop_pools.py); the sizes are measured against each game's regions, and the cause, an iPhone's address space, is a platform limit"}),
     ('present_interval', '', {'what': 'one frame per display tick', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate', 'why': 'right only for games whose logic does not count frames'}),
     ('fps_hold', '', {'what': 'no frame held past the cap', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate', 'why': "the game's pacing"}),
     ('fps_target', '', {'what': 'frame rate target', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate', 'why': 'a choice per game'}),
     ('ue_fps_cvar', '', {'what': "the game's own Unreal frame-limit variable", 'now': 'game', 'goal': 'game', 'purpose': 'frame rate', 'why': "the game's own variable, which its settings apply to t.MaxFPS; the rewriter finds it by name (ue_cvar.py)"}),
     ('perf_mode', '', {'what': 'Boost whatever the operation mode', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'a combination a Switch 1 never reports: a choice per game'}),
+    ('launch_param', '', {'what': 'the launch parameter its launcher program passes', 'now': 'game', 'goal': 'game', 'purpose': 'runtime',
+     'why': "what another program of the application hands over with oe::ExecuteProgram, for one run alone"}),
+    ('programs', '', {'what': 'the other programs of a game of several programs', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'which programs a game has that this host can run: a fact of its files, the profiles that exist for them'}),
+    ('program_of', '', {'what': 'the first program of the game this one belongs to', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'as programs'}),
+    ('jit_key_data', '', {'what': 'the bytes of a nn::jit request that make the request', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': "the layout of the game's own request struct, for the image an iPhone serves"}),
+    ('jit_route', '', {'what': 'a route for the nn::jit capture', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': "the game's own menus, for the image an iPhone serves"}),
+    ('jit_out_code', '', {'what': 'where a nn::jit output lists the code it made', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': "the layout of the game's own output buffer, for the image an iPhone serves"}),
     ('op_mode', '', {'what': 'the operation mode at start', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': "the game's controls (handheld: the touch screen instead of a gyro pointer)"}),
 ]
 
@@ -170,11 +183,15 @@ def frame_step_sites(fn):   # (offset, reason) of each site a FRAME_STEP functio
     return sorted(puts), ctx.render_scale
 
 
+def host_files():   # the host's tracked sources without its tests: what the build-ID scan below and the title-ID check (test_architecture.py) read
+    tracked = subprocess.run(['git', 'ls-files', *HOST], cwd=REPO, capture_output=True, text=True, check=True).stdout.split('\n')
+    files = sorted(REPO / f for f in set(tracked) if f)   # a set: ls-files lists a file in a merge conflict once per stage
+    return [p for p in files if p.suffix in HOST_EXT and 'tests' not in p.relative_to(REPO).parts[2:]]
+
+
 def host_rows(builds):   # {build ID: [(file, line, what)]}: rows and checks of the host keyed by a main build ID
     out = {}
-    tracked = subprocess.run(['git', 'ls-files', *HOST], cwd=REPO, capture_output=True, text=True, check=True).stdout.split('\n')
-    for p in sorted(REPO / f for f in set(tracked) if f):   # a set: ls-files lists a file in a merge conflict once per stage
-        if p.suffix not in HOST_EXT or 'tests' in p.relative_to(REPO).parts[2:]: continue
+    for p in host_files():
         table = None
         for n, line in enumerate(p.read_text(errors='replace').split('\n'), 1):
             m = re.search(r'\b(k_\w+)\s*\[\]\s*=', line)
