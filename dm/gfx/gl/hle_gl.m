@@ -39,6 +39,8 @@ void dm_vi_layer_size(int *w, int *h);   // hle_vi.c: the size of the last sized
 #define RED1(...) do { static int once_; if (!once_) { once_ = 1; LOG("[gl] [RED] " __VA_ARGS__); } } while (0)
 static int g_log;
 #define OLOG(...) do { if (g_log) GLOG(__VA_ARGS__); } while (0)
+#define TLOG(...) do { if (g_log) GLOG(__VA_ARGS__); } while (0)
+static int g_bc;        // the Metal device supports BC texture compression (A16 does not: compressed uploads are decoded)
 
 typedef uint32_t GLenum, GLuint, GLbitfield; typedef int32_t GLint, GLsizei; typedef float GLfloat; typedef double GLdouble; typedef char GLchar; typedef intptr_t GLsizeiptr, GLintptr;
 typedef void *EGLDisplay, *EGLConfig, *EGLContext, *EGLSurface; typedef int32_t EGLint; typedef uint32_t EGLBoolean, EGLenum;
@@ -332,7 +334,7 @@ static const samp_p SAMP_P0 = {.minf = GL_NEAREST_MIPMAP_LINEAR, .magf = GL_LINE
 #define MAXLV 16
 typedef struct { void *data; size_t pitch, size; uint32_t w, h; } level_t;
 typedef struct {
-    GLenum target; int made, fmt, levels, slevels; uint32_t w, h, d; uint64_t use, gen;
+    GLenum target; int made, fmt, bc, levels, slevels; uint32_t w, h, d; uint64_t use, gen;
     level_t pend[6][MAXLV]; int defined;   // defined: bit per level whose face(s) were given
     __strong id<MTLTexture> tex; __strong id<MTLSamplerState> smp;   // smp: the Metal sampler of its own parameters, made again when smp_dirty
     samp_p sp; GLint maxlv, swz[4]; int smp_dirty;
@@ -471,7 +473,7 @@ static void win_make(uint32_t w, uint32_t h) {
 // fmt: index into g_fmt. A swizzle only where Metal's default differs from GL's: Metal reads a channel a format lacks as 0 (alpha 1), as GL does, so only the luminance /
 // alpha formats and DXT1 without alpha have one (Metal refuses a swizzle on a render target, and GL cannot render into those). Conversions on upload: CV_COPY (the bytes as given), CV_RGB8 (RGB → RGBA), CV_EXPAND_RG (RED/RG → RGBA), CV_565 / CV_4444 / CV_5551 (16-bit packed → RGBA8), CV_INDEX (8-bit colour
 // indices through the glColorTable palette). bw / bh: block size of a compressed format, bytes: per texel or per block
-enum { CV_COPY, CV_RGB8, CV_565, CV_4444, CV_5551, CV_INDEX, CV_NONE, CV_EXPAND_RG };
+enum { CV_COPY, CV_RGB8, CV_565, CV_4444, CV_5551, CV_INDEX, CV_NONE, CV_EXPAND_RG, CV_BC1, CV_BC2, CV_BC3, CV_BC4, CV_BC5, CV_BC7, CV_BC6H };
 enum { K_COL, K_DEPTH, K_DS, K_BLOCK };
 typedef struct { MTLPixelFormat pf; uint8_t bytes, bw, bh, kind; MTLTextureSwizzleChannels swz; const char *name; } fmt_t;
 #define SWZ(r, g, b, a) {MTLTextureSwizzle##r, MTLTextureSwizzle##g, MTLTextureSwizzle##b, MTLTextureSwizzle##a}
@@ -583,6 +585,38 @@ static int fmt_pick(GLint ifmt, GLenum format, GLenum type, int *cv) {
 }
 static size_t fmt_pitch(int f, uint32_t w) { const fmt_t *m = &g_fmt[f]; return (size_t)((w + m->bw - 1) / m->bw) * m->bytes; }
 static size_t fmt_rows(int f, uint32_t h) { const fmt_t *m = &g_fmt[f]; return (h + m->bh - 1) / m->bh; }
+// BC decoding (dm/third_party/bcdec, also used by the NVN layer): A16 has no BC hardware, so a compressed upload becomes RGBA8/R8/RG8. The nvn_bcdec.c
+// translation unit has the implementations; these are its prototypes with the BC4/BC5 signed flag it is compiled with.
+extern void bcdec_bc1(const void *, void *, int);
+extern void bcdec_bc2(const void *, void *, int);
+extern void bcdec_bc3(const void *, void *, int);
+extern void bcdec_bc4(const void *, void *, int, int);
+extern void bcdec_bc5(const void *, void *, int, int);
+extern void bcdec_bc7(const void *, void *, int);
+static int bc_block_bytes(int cv) { return cv == CV_BC1 || cv == CV_BC4 ? 8 : 16; }
+static int bc_pixel_bytes(int cv) { return cv == CV_BC4 ? 1 : cv == CV_BC5 ? 2 : 4; }
+static size_t bc_src_size(int cv, uint32_t w, uint32_t h) { return (size_t)((w + 3) / 4) * ((h + 3) / 4) * bc_block_bytes(cv); }
+static void bc_decode(int cv, const uint8_t *src, size_t sp, uint32_t w, uint32_t h, uint8_t *dst, size_t dp) {
+    if (!src) return;
+    int bb = bc_block_bytes(cv), bpp = bc_pixel_bytes(cv);
+    for (uint32_t by = 0; by * 4 < h; by++) for (uint32_t bx = 0; bx * 4 < w; bx++) {
+        const uint8_t *b = src + by * sp + bx * bb;
+        uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4, ch = h - by * 4 < 4 ? h - by * 4 : 4;
+        uint8_t *o = dst + (size_t)by * 4 * dp + (size_t)bx * 4 * bpp, tmp[4 * 4 * 4];
+        int full = cw == 4 && ch == 4;
+        uint8_t *d = full ? o : tmp; int pitch = full ? (int)dp : 4 * bpp;
+        switch (cv) {
+            case CV_BC1: bcdec_bc1(b, d, pitch); break;
+            case CV_BC2: bcdec_bc2(b, d, pitch); break;
+            case CV_BC3: bcdec_bc3(b, d, pitch); break;
+            case CV_BC4: bcdec_bc4(b, d, pitch, 0); break;
+            case CV_BC5: bcdec_bc5(b, d, pitch, 0); break;
+            case CV_BC7: bcdec_bc7(b, d, pitch); break;
+            default: memset(d, 0, 4 * pitch); break;
+        }
+        if (!full) for (uint32_t y = 0; y < ch; y++) memcpy(o + y * dp, tmp + y * pitch, cw * bpp);
+    }
+}
 
 static GLenum convert_pixel(int f, GLenum format, GLenum type, const void *data, uint8_t *out);
 
@@ -590,6 +624,7 @@ static GLenum convert_pixel(int f, GLenum format, GLenum type, const void *data,
 static void *pixels_convert(const void *src, uint32_t w, uint32_t h, GLenum format, GLenum type, int f, int cv, size_t *pitch_out) {
     size_t dp = fmt_pitch(f, w), rows = fmt_rows(f, h);
     uint8_t *dst = zalloc(dp * rows + 1); *pitch_out = dp;
+    if (cv >= CV_BC1) { bc_decode(cv, src, (size_t)((w + 3) / 4) * bc_block_bytes(cv), w, h, dst, dp); return dst; }
     if (!src) return dst;
     if (g_fmt[f].kind == K_BLOCK) { memcpy(dst, src, dp * rows); return dst; }   // compressed data has no unpack rows
     static const int comps_of[] = {[GL_RED - GL_RED] = 1, [GL_GREEN - GL_RED] = 1, [GL_BLUE - GL_RED] = 1, [GL_ALPHA - GL_RED] = 1, [GL_RGB - GL_RED] = 3, [GL_RGBA - GL_RED] = 4,
@@ -1796,9 +1831,6 @@ GL(glTexSubImage2D, void, GLenum target, GLint level, GLint x, GLint y, GLsizei 
     TLOG("tex sub image 2D target %#x level %d %d,%d %dx%d format %#x type %#x pixels %p", target, level, x, y, w, h, format, type, pixels);
     teximg_args a = {target, level, 0, x, y, w, h, format, type, pixels, 0, 1, 0}; ((void (*)(const teximg_args *))(const void *)teximg_impl_bs)(&a);
 }
-GL(glCompressedTexSubImage2D, void, GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLsizei size, const void *data) {   // blocks copied as they are, as glCompressedTexImage2D's
-    (void)format; (void)size; teximg_args a = {target, level, 0, x, y, w, h, 0, 0, data, size, 1, 1}; ((void (*)(const teximg_args *))(const void *)teximg_impl_bs)(&a);
-}
 GL(glCompressedTexImage2D, void, GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLint border, GLsizei size, const void *data) {
     (void)border; teximg_args a = {target, level, (GLint)ifmt, 0, 0, w, h, 0, 0, data, size, 0, 1}; ((void (*)(const teximg_args *))(const void *)teximg_impl_bs)(&a);
 }
@@ -1977,9 +2009,10 @@ static void compressed_impl(const compressed_args *a) {
         if (a->level < 0 || a->level >= MAXLV || a->w < 0 || a->h < 0 || a->d < 0 || a->size < 0 || a->border ||
             (uint32_t)a->w > (16384u >> a->level) || (uint32_t)a->h > (16384u >> a->level) || a->d > 2048) { gl_error(GL_INVALID_VALUE); return; }
         int cv, f = fmt_pick(a->format, 0, 0, &cv);
+        int bc = cv >= CV_BC1;   // no BC hardware: the compressed image is decoded into f's uncompressed format
         if (f < 0) { RED1("glCompressedTex%sImage%dD format %#x not mapped", sub, a->dims, a->format); return; }
-        if (g_fmt[f].kind != K_BLOCK) { gl_error(GL_INVALID_ENUM); return; }   // not a compressed format
-        size_t pitch = fmt_pitch(f, a->w), rows = fmt_rows(f, a->h);
+        if (g_fmt[f].kind != K_BLOCK && !bc) { gl_error(GL_INVALID_ENUM); return; }   // not a compressed format
+        size_t pitch = bc ? (size_t)((a->w + 3) / 4) * bc_block_bytes(cv) : fmt_pitch(f, a->w), rows = bc ? (a->h + 3) / 4 : fmt_rows(f, a->h);
         if (rows && pitch > SIZE_MAX / rows) { gl_error(GL_INVALID_VALUE); return; }
         size_t layer = pitch * rows;
         if (a->d && layer > SIZE_MAX / (uint32_t)a->d) { gl_error(GL_INVALID_VALUE); return; }
@@ -1992,6 +2025,18 @@ static void compressed_impl(const compressed_args *a) {
             // All levels in a complete array have the same layer count.
             if (a->level && (t->made || t->defined) && (t->d != (uint32_t)a->d || t->fmt != f ||
                 umax(1, t->w >> a->level) != (uint32_t)a->w || umax(1, t->h >> a->level) != (uint32_t)a->h)) { gl_error(GL_INVALID_OPERATION); return; }
+            if (bc) {   // no BC: decode the blocks into the texture's uncompressed format, one layer at a time
+                size_t dp = fmt_pitch(f, a->w); void *dec = NULL;
+                if (a->data) {
+                    size_t lsz; void *one = pixels_convert(a->data, a->w, a->h, 0, 0, f, cv, &dp); lsz = dp * fmt_rows(f, a->h);
+                    dec = malloc(lsz * (size_t)(a->d ? a->d : 1));
+                    if (!dec) { free(one); gl_error(0x0505); return; }
+                    memcpy(dec, one, lsz); free(one);
+                    for (GLsizei k = 1; k < a->d; k++) { void *p = pixels_convert((const uint8_t *)a->data + (size_t)k * layer, a->w, a->h, 0, 0, f, cv, &dp); memcpy((uint8_t *)dec + (size_t)k * lsz, p, lsz); free(p); }
+                }
+                tex_image(a->target, a->level, f, CV_COPY, a->w, a->h, a->d, dec, dp);
+                return;
+            }
             void *copy = NULL;
             if (a->data && a->size) { copy = zalloc((size_t)a->size); memcpy(copy, a->data, (size_t)a->size); }
             tex_image(a->target, a->level, f, CV_COPY, a->w, a->h, a->d, copy, pitch);
@@ -2006,19 +2051,31 @@ static void compressed_impl(const compressed_args *a) {
         if (a->x % m->bw || a->y % m->bh || (a->w % m->bw && a->x + a->w != w) || (a->h % m->bh && a->y + a->h != h)) { gl_error(GL_INVALID_OPERATION); return; }
         if (!a->w || !a->h || !a->d) return;
         if (!a->data) { gl_error(GL_INVALID_VALUE); return; }
+        if (bc && (a->x % 4 || a->y % 4)) { gl_error(GL_INVALID_OPERATION); return; }   // a block sub-rect starts on a block
+        const void *src = a->data; size_t spitch = pitch, srows = rows; void *dec = NULL;
+        if (bc) {   // no BC: decode each layer's blocks into the texture's uncompressed format
+            size_t dp; size_t lsz; void *one = pixels_convert(a->data, a->w, a->h, 0, 0, f, cv, &dp); lsz = dp * fmt_rows(f, a->h);
+            dec = malloc(lsz * (size_t)(a->d ? a->d : 1));
+            if (!dec) { free(one); gl_error(0x0505); return; }
+            memcpy(dec, one, lsz); free(one);
+            for (GLsizei k = 1; k < a->d; k++) { void *p = pixels_convert((const uint8_t *)a->data + (size_t)k * layer, a->w, a->h, 0, 0, f, cv, &dp); memcpy((uint8_t *)dec + (size_t)k * lsz, p, lsz); free(p); }
+            src = dec; spitch = dp; srows = fmt_rows(f, a->h);
+        }
         // Before the Metal texture is made, the bytes go into the level's pending copy: making it here would fix its level count at the levels given so far, and a
         // level given afterwards (allocate and fill level 0, then level 1, ...) would be dropped. glTexStorage storage has all its levels: made now
         if (!t->made && !t->slevels && l->w == w && l->h == h) {
             if (!l->data) l->data = zalloc(l->size);
             size_t ll = l->pitch * fmt_rows(f, h), off = (size_t)(a->y / m->bh) * l->pitch + (size_t)(a->x / m->bw) * m->bytes;
-            for (GLsizei k = 0; k < a->d; k++) for (size_t r = 0; r < rows; r++)
-                memcpy((uint8_t *)l->data + (size_t)(a->z + k) * ll + off + r * l->pitch, (const uint8_t *)a->data + k * layer + r * pitch, pitch);
+            for (GLsizei k = 0; k < a->d; k++) for (size_t r = 0; r < srows; r++)
+                memcpy((uint8_t *)l->data + (size_t)(a->z + k) * ll + off + r * l->pitch, (const uint8_t *)src + k * spitch * srows + r * spitch, spitch);
+            free(dec);
             return;
         }
-        if (!t->made && !tex_make(t, 0)) return;
-        if (!t->tex || a->level >= t->levels) { gl_error(GL_INVALID_OPERATION); return; }
+        if (!t->made && !tex_make(t, 0)) { free(dec); return; }
+        if (!t->tex || a->level >= t->levels) { free(dec); gl_error(GL_INVALID_OPERATION); return; }
         for (GLsizei k = 0; k < a->d; k++)
-            tex_write(t, arr ? a->z + k : face, a->level, a->x, a->y, 0, a->w, a->h, (const uint8_t *)a->data + k * layer, pitch);
+            tex_write(t, arr ? a->z + k : face, a->level, a->x, a->y, 0, a->w, a->h, (const uint8_t *)src + k * spitch * srows, spitch);
+        free(dec);
     }
 }
 static void compressed_call(compressed_args a) { ((void (*)(const compressed_args *))(const void *)compressed_impl_bs)(&a); }
